@@ -39,7 +39,7 @@ from skimage.io import imread
 # Constants
 FILENAME = 'Image_001_001.raw'
 PREVIEW_FILENAME = 'ChanC_Preview.tif'
-
+MAXCHUNKSIZE = 1024*288*2*3 # Max memory of the GPU
 
 class DataUpdater(QObject):
     """Qt object for thread-safe communication"""
@@ -94,16 +94,39 @@ class ThorlabsLiveViewerSimple:
         self.stop_flag = threading.Event()
         self.monitoring_active = False
         self.data_lock = threading.Lock()
+        self.use_gaussian_filter = True  # Default to enabled
         
         # Qt-based updater
         self.updater = DataUpdater()
         self.updater.data_ready.connect(self._update_viewer_main_thread)
         
-        # Create Napari viewer (main thread only)
+        # Create Napari viewer (main thread only) - create once and reuse
         self.app = napari.Viewer(title=f"Simple Thorlabs Live Viewer - {os.path.basename(folder)}")
         self.image_layer = None
+        self._setup_napari_layers()
+
         
         print("✅ Initialization complete")
+    
+    def _setup_napari_layers(self):
+        """Setup initial Napari layers"""
+        # Add shapes layer for annotations if it doesn't exist
+        try:
+            # Check if Annotations layer already exists
+            annotations_layer = None
+            for layer in self.app.layers:
+                if layer.name == 'Annotations':
+                    annotations_layer = layer
+                    break
+            
+            if annotations_layer is None:
+                self.app.add_shapes(
+                    None, shape_type='rectangle', name='Annotations',
+                    edge_width=3, face_color=np.array([0, 0, 0, 0]),
+                    edge_color='red'
+                )
+        except Exception as e:
+            print(f"⚠️  Could not setup shapes layer: {e}")
     
     def getImage(self, n):
         """Load a single frame"""
@@ -137,18 +160,24 @@ class ThorlabsLiveViewerSimple:
         # Basic processing (no GPU for simplicity)
         return stack
     
-    def start_live_monitoring(self, chunk_size=3, wait_time=0.3):
+    def start_live_monitoring(self, chunk_size=3, wait_time=0.3, use_gaussian_filter=True):
         """Start live monitoring with simple background thread"""
         if self.monitoring_active:
             print("⚠️  Monitoring already active")
             return
         
+        # Reset data arrays for fresh start
+        self.reset_data_arrays()
+        
         self.monitoring_active = True
         self.stop_flag.clear()
+        self.use_gaussian_filter = use_gaussian_filter
         
+        filter_status = "🌟 enabled" if use_gaussian_filter else "🚫 disabled"
         print(f"🎬 Starting simple live monitoring:")
         print(f"   • Chunk size: {chunk_size} frames")
         print(f"   • Wait time: {wait_time}s at live edge")
+        print(f"   • Gaussian filter: {filter_status}")
         print(f"   • Total frames allocated: {self.nFrames}")
         
         def monitoring_thread():
@@ -199,6 +228,21 @@ class ThorlabsLiveViewerSimple:
                     # Update data arrays (thread-safe)
                     if new_block.size > 0:
                         with self.data_lock:
+                            if self.use_gaussian_filter:
+                                if sys.platform != 'darwin':
+                                    # GPU processing path
+                                    new_block2 = cp.asarray(new_block, dtype=np.uint16)
+                                    new_block_filtered = gaussian_filter(new_block2, (2,2,2))
+                                    new_block = cp.asnumpy(new_block_filtered)
+                                    
+                                    # Explicitly free GPU memory
+                                    del new_block2, new_block_filtered
+                                    cp.get_default_memory_pool().free_all_blocks()
+                                else:
+                                    # CPU processing path
+                                    new_block = gaussian_filter(new_block, (2,2,2))
+                            # If Gaussian filter is disabled, use raw data as-is
+                            
                             self.array = np.vstack([self.array, new_block])
                             current_frame += new_block.shape[0]
                             self.currentLastFrame = self.array.shape[0]
@@ -236,22 +280,31 @@ class ThorlabsLiveViewerSimple:
             if self.image_layer is None:
                 # Create layer first time
                 self.image_layer = self.app.add_image(data, name='Live Stream')
-                
-                # Add shapes layer for annotations
-                try:
-                    self.app.add_shapes(
-                        None, shape_type='rectangle', name='Annotations',
-                        edge_width=3, face_color=np.array([0, 0, 0, 0]),
-                        edge_color='red'
-                    )
-                except:
-                    pass  # Shapes might already exist
             else:
                 # Update existing layer
                 self.image_layer.data = data
                 
         except Exception as e:
             print(f"⚠️  Viewer update error: {e}")
+    
+    def reset_data_arrays(self):
+        """Reset data arrays for fresh monitoring session"""
+        with self.data_lock:
+            self.currentLastFrame = 0
+            self.array = np.empty((0, self.height, self.width), dtype=np.uint16)
+            
+            # Check if Live Stream layer already exists and reuse it
+            self.image_layer = None
+            for layer in self.app.layers:
+                if layer.name == 'Live Stream':
+                    self.image_layer = layer
+                    print("🔄 Reusing existing 'Live Stream' layer")
+                    break
+            
+            if self.image_layer is None:
+                print("🔄 No existing 'Live Stream' layer found - will create new one")
+                
+        print("🔄 Data arrays reset for new monitoring session")
     
     def stop_monitoring(self):
         """Stop the live monitoring"""
@@ -263,6 +316,24 @@ class ThorlabsLiveViewerSimple:
             print("✅ Monitoring stopped")
         else:
             print("ℹ️  Monitoring not active")
+    
+    def cleanup_gpu_memory(self):
+        """Cleanup GPU memory resources"""
+        if sys.platform != 'darwin':
+            try:
+                # Free all GPU memory pools
+                cp.get_default_memory_pool().free_all_blocks()
+                print("🧹 GPU memory cleaned up")
+            except Exception as e:
+                print(f"⚠️  GPU cleanup warning: {e}")
+    
+    def close(self):
+        """Safely close the viewer and cleanup resources"""
+        self.stop_monitoring()
+        self.cleanup_gpu_memory()
+        if hasattr(self, 'r') and self.r:
+            self.r.close()
+        print("✅ Viewer closed safely")
     
     def get_status(self):
         """Get current monitoring status"""
@@ -280,11 +351,11 @@ class ThorlabsLiveViewerSimple:
             'remaining': remaining
         }
     
-    def restart_monitoring(self, chunk_size=3, wait_time=0.3):
+    def restart_monitoring(self, chunk_size=3, wait_time=0.3, use_gaussian_filter=True):
         """Restart monitoring with new parameters"""
         self.stop_monitoring()
         time.sleep(0.5)  # Brief pause
-        self.start_live_monitoring(chunk_size, wait_time)
+        self.start_live_monitoring(chunk_size, wait_time, use_gaussian_filter)
     
     def run_interactive(self):
         """Run interactive mode with controls"""
@@ -315,6 +386,7 @@ class ThorlabsLiveViewerSimple:
             print("\n🛑 Interrupted by user")
         finally:
             self.stop_monitoring()
+            self.cleanup_gpu_memory()
 
 
 def main():
@@ -326,6 +398,8 @@ def main():
                         help='Frames to load per chunk (default: 3)')
     parser.add_argument('--wait-time', type=float, default=0.3,
                         help='Wait time at live edge in seconds (default: 0.3)')
+    parser.add_argument('--no-gaussian', action='store_true',
+                        help='Disable Gaussian filter (default: enabled)')
 
     
     args = parser.parse_args()
@@ -337,7 +411,8 @@ def main():
         # Start monitoring
         viewer.start_live_monitoring(
             chunk_size=args.chunk_size,
-            wait_time=args.wait_time
+            wait_time=args.wait_time,
+            use_gaussian_filter=not args.no_gaussian
         )
         
         # Show initial status
@@ -345,6 +420,9 @@ def main():
         
         # Run interactive mode
         viewer.run_interactive()
+        
+        # Cleanup when done
+        viewer.close()
         
     except FileNotFoundError as e:
         print(f"❌ File not found: {e}")
