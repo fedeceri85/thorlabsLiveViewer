@@ -2,6 +2,7 @@
 notebooks/.ipynb_checkpoints/Untitled-checkpoint.ipynb
 sampleImage/ChanC_Preview.tif
 sampleImage/Image_001_001.raw
+sampleImage/*
 2_002/ChanC_Preview.tif
 2_002/Experiment.xml
 2_002/Image_001_001.raw
