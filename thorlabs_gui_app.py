@@ -377,7 +377,13 @@ class ThorlabsGUI(QMainWindow):
         self.roi_enable_checkbox = QCheckBox("Enable ROI Plot")
         self.roi_enable_checkbox.setChecked(True) # Default on
         self.roi_enable_checkbox.toggled.connect(self.toggle_roi_monitoring)
-        roi_layout.addWidget(self.roi_enable_checkbox, 0, 0, 1, 2)
+        roi_layout.addWidget(self.roi_enable_checkbox, 0, 0)
+
+        # Auto-update ROIs checkbox
+        self.auto_roi_checkbox = QCheckBox("Auto-update ROIs")
+        self.auto_roi_checkbox.setChecked(True)
+        self.auto_roi_checkbox.setToolTip("Update ROI plot automatically when new frames arrive")
+        roi_layout.addWidget(self.auto_roi_checkbox, 0, 1)
         
         # Info label
         roi_info = QLabel("Draw shapes in Napari to create ROIs")
@@ -637,6 +643,9 @@ class ThorlabsGUI(QMainWindow):
             self.log_status(f"Started: Chunk={chunk_size}")
             self.viewer_backend.start_live_monitoring(chunk_size, wait_time, use_gaussian_filter=use_gaussian)
 
+            # Connect backend data signal to ROI update logic
+            self.viewer_backend.updater.data_ready.connect(self.on_data_ready)
+
             # Connect to Napari shapes layer
             self.connect_to_napari_shapes()
 
@@ -758,6 +767,12 @@ class ThorlabsGUI(QMainWindow):
         if self.viewer_backend and hasattr(self.viewer_backend, 'array'):
              self.update_roi_plot(self.viewer_backend.array)
              self.log_status("Updated ROI Data")
+
+    def on_data_ready(self, data):
+        """Called when backend has new data ready"""
+        if self.roi_enabled and self.auto_roi_checkbox.isChecked():
+            # Trigger ROI update with the new data stack
+            self.update_roi_plot(data)
 
     def update_roi_plot(self, image_data):
         """Update ROI plot with new data"""
