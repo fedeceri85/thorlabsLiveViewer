@@ -39,6 +39,12 @@ from qtpy.QtGui import QFont, QIcon, QPalette
 import pyqtgraph as pg
 import numpy as np
 import napari
+# Import internal Napari widgets to reconstruct the UI
+try:
+    from napari.qt import QtViewer
+except ImportError:
+    print("Warning: Could not import Napari QtViewer")
+    QtViewer = None
 
 # Import the live viewer
 from thorlabs_live_viewer_simple import ThorlabsLiveViewerSimple
@@ -65,6 +71,8 @@ class ThorlabsGUI(QMainWindow):
         self.roi_enabled = True
         self.roi_data = {}  # Dictionary to store data for multiple ROIs
         self.napari_shapes_layer = None
+        self.roi_dirty = False # Flag to trigger full recalculation
+        self.last_roi_frame_index = 0 # Track last processed frame
         
         # ROI color management
         self.roi_colors = ['#00ff00', '#ff0000', '#0000ff', '#ffff00', '#ff00ff', '#00ffff', 
@@ -445,10 +453,30 @@ class ThorlabsGUI(QMainWindow):
         # Use QSplitter for resizable panels
         self.right_splitter = QSplitter(Qt.Vertical)
         
-        # 1. Napari Viewer Widget
-        # Grab the Qt widget from the Napari instance
-        self.napari_widget = self.napari_viewer.window.qt_viewer
-        self.right_splitter.addWidget(self.napari_widget)
+        # 1. Napari Window Embedding (Complete QMainWindow)
+        self.napari_container = QWidget()
+        napari_layout = QHBoxLayout(self.napari_container)
+        napari_layout.setContentsMargins(0,0,0,0)
+        
+        try:
+             # Get the actual QMainWindow from Napari
+             napari_main_window = self.napari_viewer.window._qt_window
+             
+             # Clean up: Remove from any previous parent if needed (though it's usually top-level)
+             # Important: We must convert it to a widget type to be embedded
+             napari_main_window.setWindowFlags(Qt.Widget)
+             
+             # Add to our layout
+             napari_layout.addWidget(napari_main_window)
+             print("✅ Embedded Napari Main Window")
+             
+        except Exception as e:
+            print(f"❌ Error embedding Napari window: {e}")
+            # Fallback (Just Canvas)
+            self.napari_canvas = self.napari_viewer.window.qt_viewer
+            napari_layout.addWidget(self.napari_canvas)
+        
+        self.right_splitter.addWidget(self.napari_container)
         
         # 2. ROI Plot Widget
         self.roi_plot_widget = pg.PlotWidget(title="ROI Intensities")
@@ -666,6 +694,8 @@ class ThorlabsGUI(QMainWindow):
             self.roi_data = {}
             self.roi_color_map = {}
             self.color_index = 0
+            self.roi_dirty = True
+            self.last_roi_frame_index = 0
         else:
             self.log_status("ROI Plot Disabled")
     
@@ -679,9 +709,15 @@ class ThorlabsGUI(QMainWindow):
         for layer in self.napari_viewer.layers:
             if layer.name == 'Annotations':
                 self.napari_shapes_layer = layer
+                # Connect events
                 layer.events.data.connect(self.on_shapes_changed)
+                layer.events.highlight.connect(self.on_shapes_changed) # sometimes needed
                 found = True
                 self.log_status("Linked to ROI layer")
+                
+                # Reset tracking
+                self.roi_dirty = True
+                self.last_roi_frame_index = 0
                 break
         
         if not found and len(self.napari_viewer.layers) > 0:
@@ -691,6 +727,8 @@ class ThorlabsGUI(QMainWindow):
     def on_shapes_changed(self, event):
         """Called when shapes are modified in Napari"""
         if self.roi_enabled:
+            # Mark as dirty to trigger full recalculation on next update
+            self.roi_dirty = True
             self.update_shape_colors()
     
     def update_shape_colors(self):
@@ -723,54 +761,115 @@ class ThorlabsGUI(QMainWindow):
 
     def update_roi_plot(self, image_data):
         """Update ROI plot with new data"""
-        # Reuse logic from original file but adapted
         if not self.roi_enabled or image_data is None or image_data.size == 0:
             return
             
         if self.napari_shapes_layer is None:
             self.connect_to_napari_shapes()
+            # If still None, try to get it from viewer again (maybe user created it)
+            if self.napari_shapes_layer is None:
+                 for layer in self.napari_viewer.layers:
+                    if layer.name == 'Annotations':
+                        self.napari_shapes_layer = layer
+                        layer.events.data.connect(self.on_shapes_changed)
+                        self.roi_dirty = True
+                        break
             if self.napari_shapes_layer is None: return
 
         try:
-            current_frame_idx = len(image_data) - 1
-            if len(image_data.shape) == 3:
-                current_image = image_data[-1]
-            else:
-                current_image = image_data
+            # Handle Dirty State (ROI Changed)
+            if self.roi_dirty:
+                self.roi_data = {}
+                self.last_roi_frame_index = 0
+                # We will process from 0 to end
+                self.roi_dirty = False
                 
-            shapes_data = self.napari_shapes_layer.data
+            total_frames = len(image_data)
+            start_frame = self.last_roi_frame_index
             
-            for i, shape in enumerate(shapes_data):
+            # If we are somehow ahead (shouldn't happen unless reset), reset
+            if start_frame > total_frames:
+                start_frame = 0
+                self.roi_data = {}
+            
+            # Nothing new to process
+            if start_frame == total_frames:
+                return
+
+            # Get shapes once
+            shapes_data = self.napari_shapes_layer.data
+            if len(shapes_data) == 0:
+                self.last_roi_frame_index = total_frames
+                self.roi_plot_widget.clear()
+                return
+
+            # Prepare data structure
+            for i in range(len(shapes_data)):
                 roi_name = f"ROI_{i}"
                 if roi_name not in self.roi_data:
                     self.roi_data[roi_name] = []
-                    # Backfill? (skipped for simplicity, assume starting now or manual update)
+
+            # Optimization: Pre-compute masks for simple shapes if possible
+            # For now, just iterate. Speed should be fine for typical ROI counts.
+            
+            # We need to process image_data[start_frame : total_frames]
+            # If image_data is (N, H, W)
+            
+            new_chunk = image_data[start_frame:total_frames]
+            
+            # Iterate over shapes
+            from skimage.draw import polygon
+            
+            # Cache masks for this update
+            masks = []
+            valid_shapes = []
+            
+            for i, shape in enumerate(shapes_data):
+                 if len(shape) >= 3:
+                     # Create mask
+                     # Note: shape coordinates are (row, col)
+                     # We assume image dimensions match the last frame
+                     # This might fail if image size changes, but that shouldn't happen live
+                     H, W = image_data[0].shape
+                     r, c = polygon(shape[:, 0], shape[:, 1], (H, W))
+                     
+                     if len(r) > 0:
+                         masks.append((r, c))
+                         valid_shapes.append(i)
+            
+            if not masks:
+                self.last_roi_frame_index = total_frames
+                return
                 
-                # Check if we need to calculate for current frame
-                if len(self.roi_data[roi_name]) <= current_frame_idx:
-                    # Simple mask extraction
-                    if len(shape) >= 3:
-                        from skimage.draw import polygon
-                        r, c = polygon(shape[:, 0], shape[:, 1], current_image.shape)
-                        # Clip
-                        r = np.clip(r, 0, current_image.shape[0]-1)
-                        c = np.clip(c, 0, current_image.shape[1]-1)
-                        
-                        if len(r) > 0:
-                            mean_val = np.mean(current_image[r, c])
-                            # If we are way behind, might need to fill gaps. 
-                            # For simplified live view, just append.
-                            self.roi_data[roi_name].append(mean_val)
+            # Compute means for the chunk
+            # Vectorized approach: 
+            # We want mean intensity for each ROI for each frame in new_chunk.
+            
+            # Loop over frames in chunk
+            for frame_idx in range(len(new_chunk)):
+                frame = new_chunk[frame_idx]
+                
+                for k, (r, c) in enumerate(masks):
+                    shape_idx = valid_shapes[k]
+                    roi_name = f"ROI_{shape_idx}"
+                    
+                    mean_val = np.mean(frame[r, c])
+                    self.roi_data[roi_name].append(mean_val)
+            
+            # Update index
+            self.last_roi_frame_index = total_frames
             
             # Update plot
             self.roi_plot_widget.clear()
             for roi_name, data in self.roi_data.items():
                 if roi_name in self.roi_color_map:
                     color = self.roi_color_map[roi_name]
+                    # Plot full history
                     self.roi_plot_widget.plot(data, pen=pg.mkPen(color, width=2), name=roi_name)
                     
         except Exception as e:
-            pass # print(f"ROI Update Error: {e}")
+            # print(f"ROI Update Error: {e}")
+            pass
 
     def update_status_display(self, message):
         """Update status log"""

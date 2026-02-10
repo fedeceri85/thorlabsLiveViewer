@@ -1,145 +1,92 @@
 # Thorlabs Live Viewer
 
-Real-time viewer for Thorlabs microscopy data with GUI control panel and background threading.
+Real-time visualization tool for monitoring raw microscopy data as it is being acquired by Thorlabs systems.
 
 ## Overview
 
-This application provides live monitoring of raw files being written in real-time by Thorlabs microscopy systems, with automatic Napari viewer updates and comprehensive parameter control.
+This application allows users to view live updates of `Image_001_001.raw` files in an integrated Napari viewer without interrupting the acquisition process. It features a modern Qt-based control panel for parameter configuration and real-time ROI (Region of Interest) intensity monitoring.
 
 ## Features
 
-- 🖥️ **GUI Control Panel**: Easy-to-use interface for parameter adjustment
-- 📂 **Folder Management**: Browse and validate data folders automatically
-- 🚀 **Real-time Monitoring**: Background threading for live data updates
-- 📊 **Progress Tracking**: Real-time frame counting and progress bars
-- ⚙️ **Parameter Control**: Adjust chunk size, wait time, and FPS settings
-- 🔄 **Auto Reset**: Automatic reset when selecting new folders
-- 🎬 **Test Data Generation**: Built-in test data generator for demonstration
-- 🛡️ **Thread Safety**: Proper Qt-based GUI updates (macOS compatible)
+- 🖥️ **Integrated GUI**: Single-window interface combining controls, Napari viewer, and ROI plots.
+- 📂 **Experiment Management**: Browse root folders and select active experiments from a dynamic dropdown.
+- 🚀 **Real-time Monitoring**: Background threading for live data updates with Gaussian smoothing (GPU support via `cupy` if available).
+- 📊 **ROI Monitoring**: Draw shapes in Napari to plot mean intensity values in real-time.
+- ⚙️ **Parameter Control**: Adjust chunk size and wait times on the fly.
+- �️ **Thread Safety**: Robust Qt-based implementation compatible with Linux and macOS.
+- 🎬 **Test Data Generation**: Includes a simulator for testing without a physical microscope.
 
 ## Quick Start
 
-1. **Launch with test data:**
-   ```bash
-   python thorlabs_viewer.py --generate-test
-   ```
+### 1. Setup Environment
 
-2. **Launch with existing data:**
-   ```bash
-   python thorlabs_viewer.py --folder /path/to/your/data
-   ```
-
-3. **Launch GUI only:**
-   ```bash
-   python thorlabs_viewer.py
-   ```
-
-## Requirements
-
-- Python 3.8+
-- napari environment with Qt support
-- Required packages: `numpy`, `napari`, `qtpy`, `skimage`
-
-### Environment Setup
+It is recommended to use a virtual environment:
 
 ```bash
-# Activate the napari environment
-conda activate napari
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-# Install additional dependencies if needed
-conda install qtpy
+### 2. Launch Application
+
+**Using Launcher Scripts:**
+- **Linux/macOS:** `./start_thorlabs_viewer.sh`
+- **Windows:** `start_thorlabs_viewer.bat`
+
+**Manual Launch:**
+```bash
+python thorlabs_gui_app.py
+```
+
+### 3. Generate Test Data (Optional)
+
+To test the viewer without a microscope, run the generator in a separate terminal:
+```bash
+python src/generate_live_raw.py --fps 5
 ```
 
 ## Project Structure
 
 ```
-thorlabs_viewer.py          # Main launcher
-src/                        # Core application files
-├── thorlabs_gui_app.py     # GUI application
-├── thorlabs_live_viewer_simple.py  # Live viewer engine
-├── generate_live_raw.py    # Test data generator
-└── launch_gui.py           # Alternative launcher
-archive/                    # Historical notebooks and experiments
-sampleImage/                # Sample data files
-testLiveData/               # Generated test data
+.
+├── thorlabs_gui_app.py        # Main GUI Application Entry Point
+├── start_thorlabs_viewer.sh   # Linux/macOS launcher
+├── start_thorlabs_viewer.bat  # Windows launcher
+├── requirements.txt           # Python dependencies
+├── src/
+│   ├── thorlabs_live_viewer_simple.py # Backend Viewer Logic
+│   └── generate_live_raw.py           # Test Data Generator
+├── archive/                   # Historical/Unused code
+└── README.md                  # This documentation
 ```
 
 ## Usage
 
 ### GUI Application
 
-The main GUI provides:
-
-- **Folder Selection**: Browse button to select data folders
-- **Parameter Controls**: 
-  - Chunk Size: Number of frames to load per chunk (1-20)
-  - Wait Time: Wait time at live edge in seconds (0.1-5.0)
-  - Expected FPS: Expected frame rate for adaptive timing (1-60)
-- **Control Buttons**:
-  - Start Monitoring: Begin real-time monitoring
-  - Stop Monitoring: Stop current monitoring
-  - Restart: Restart with new parameters
-- **Progress Display**: Real-time frame counting and progress bar
-- **Status Log**: Comprehensive logging with timestamps
-
-### Command Line Options
-
-```bash
-python thorlabs_viewer.py --help
-```
-
-Options:
-- `--generate-test`: Generate test data before launching GUI
-- `--folder PATH`: Initial folder to open in GUI
-- `--info`: Show detailed application information
+1. **Select Root Folder**: Click "Browse" to select the directory containing your recordings.
+2. **Select Experiment**: Choose the specific experiment folder from the dropdown.
+3. **Configure Parameters**:
+   - **Chunk Size**: Number of frames to load per update.
+   - **Wait Time**: Interval between checks for new data.
+   - **Gaussian Filter**: Enable/disable spatial smoothing.
+4. **Start Monitoring**: Click "Start" to begin the live feed.
+5. **ROI Monitoring**: Draw rectangles or ellipses in the Napari "Annotations" layer to automatically see intensity plots.
 
 ## Data Requirements
 
-The application expects folders containing:
-- `Image_001_001.raw`: Raw binary image data
-- `ChanC_Preview.tif`: Preview image for dimensions
+The application expects folders to contain:
+- `Image_001_001.raw`: Growing binary file containing raw 2D frames (uint16).
+- `ChanC_Preview.tif`: A static preview image used to determine frame dimensions.
 
-## Threading Architecture
+## Requirements
 
-The application uses a safe threading model:
-- **Main Thread**: GUI updates and user interaction
-- **Background Thread**: File monitoring and data loading
-- **Qt Timers**: Thread-safe communication between threads
-
-This design prevents the GUI freezing and crashes that can occur with improper threading (especially on macOS).
-
-## Troubleshooting
-
-### Environment Issues
-```bash
-# Check if in correct environment
-python -c "import napari, qtpy; print('Environment OK')"
-
-# Activate napari environment if needed
-conda activate napari
-```
-
-### GUI Not Appearing
-- Ensure you're in the napari environment
-- Check that Qt packages are installed: `python -c "import qtpy; print('Qt OK')"`
-
-### File Not Found Errors
-- Ensure data folder contains required files (`Image_001_001.raw` and `ChanC_Preview.tif`)
-- Use the test data generator if you don't have real data
-
-## Development Notes
-
-This application evolved from Jupyter notebook experiments to a complete standalone solution. The key improvements include:
-
-1. **Proper Threading**: Qt-based thread-safe GUI updates
-2. **macOS Compatibility**: Resolved NSWindow threading issues
-3. **User Interface**: Complete GUI replacing command-line interaction
-4. **Project Organization**: Clean separation of concerns
-
-## License
-
-Research/Educational Use
+- Python 3.8+
+- Dependencies: `numpy`, `napari`, `qtpy`, `pyqtgraph`, `scikit-image`, `scipy`.
+- Optional: `cupy` or `pyclesperanto_prototype` for GPU acceleration.
 
 ## Author
 
-AI Assistant, August 2025
+Federico Ceriani  
+Last Updated: February 2026
