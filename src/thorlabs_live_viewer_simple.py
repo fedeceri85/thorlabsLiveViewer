@@ -23,9 +23,18 @@ from os.path import getsize
 from qtpy.QtCore import QTimer, QObject, Signal
 
 # Import GPU libraries
+# Import GPU libraries
+HAS_CUPY = False
 if sys.platform != 'darwin':
-    from cupyx.scipy.ndimage import gaussian_filter
-    import cupy as cp
+    try:
+        from cupyx.scipy.ndimage import gaussian_filter
+        import cupy as cp
+        HAS_CUPY = True
+        print("🚀 GPU Processing enabled (CuPy detected)")
+    except ImportError:
+        print("⚠️  CuPy not installed, falling back to CPU processing")
+        from scipy.ndimage import gaussian_filter
+        HAS_CUPY = False
 else:
     from scipy.ndimage import gaussian_filter
     try:
@@ -49,8 +58,13 @@ class DataUpdater(QObject):
 class ThorlabsLiveViewerSimple:
     """Simplified real-time viewer with robust macOS threading"""
     
-    def __init__(self, folder):
-        """Initialize the live viewer"""
+    def __init__(self, folder, viewer=None):
+        """Initialize the live viewer
+        
+        Args:
+            folder: Path to data folder
+            viewer: Optional existing napari.Viewer instance to usage
+        """
         print(f"🔬 Initializing Simple Thorlabs Live Viewer")
         
         # Setup GPU if available
@@ -101,7 +115,14 @@ class ThorlabsLiveViewerSimple:
         self.updater.data_ready.connect(self._update_viewer_main_thread)
         
         # Create Napari viewer (main thread only) - create once and reuse
-        self.app = napari.Viewer(title=f"Simple Thorlabs Live Viewer - {os.path.basename(folder)}")
+        if viewer is not None:
+             self.app = viewer
+             self.app.title = f"Simple Thorlabs Live Viewer - {os.path.basename(folder)}"
+             print("🔄 Using provided Napari viewer")
+        else:
+             self.app = napari.Viewer(title=f"Simple Thorlabs Live Viewer - {os.path.basename(folder)}")
+             print("✨ Created new Napari viewer")
+             
         self.image_layer = None
         self._setup_napari_layers()
 
@@ -229,7 +250,7 @@ class ThorlabsLiveViewerSimple:
                     if new_block.size > 0:
                         with self.data_lock:
                             if self.use_gaussian_filter:
-                                if sys.platform != 'darwin':
+                                if sys.platform != 'darwin' and HAS_CUPY:
                                     # GPU processing path
                                     new_block2 = cp.asarray(new_block, dtype=np.uint16)
                                     new_block_filtered = gaussian_filter(new_block2, (2,2,2))
@@ -319,7 +340,7 @@ class ThorlabsLiveViewerSimple:
     
     def cleanup_gpu_memory(self):
         """Cleanup GPU memory resources"""
-        if sys.platform != 'darwin':
+        if sys.platform != 'darwin' and HAS_CUPY:
             try:
                 # Free all GPU memory pools
                 cp.get_default_memory_pool().free_all_blocks()

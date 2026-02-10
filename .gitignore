@@ -8,3 +8,8 @@ sampleImage/*
 2_002/Image_001_001.raw
 2_002/ROIMask.raw
 2_002/ROIs.xaml
+.venv/
+venv/
+__pycache__/
+*.pyc
+requirements.txt
