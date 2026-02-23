@@ -23,6 +23,7 @@ Date: August 2025
 
 import os
 import sys
+import glob
 sys.path.append('./src')
 import threading
 import time
@@ -348,7 +349,7 @@ class ThorlabsGUI(QMainWindow):
         params_layout.addWidget(QLabel("Chunk Size:"), 0, 0)
         self.chunk_size_spin = QSpinBox()
         self.chunk_size_spin.setRange(100, 5000)
-        self.chunk_size_spin.setValue(100)
+        self.chunk_size_spin.setValue(500)
         self.chunk_size_spin.setToolTip("Number of frames to load per chunk")
         params_layout.addWidget(self.chunk_size_spin, 0, 1)
         
@@ -356,7 +357,7 @@ class ThorlabsGUI(QMainWindow):
         params_layout.addWidget(QLabel("Wait Time (s):"), 1, 0)
         self.wait_time_spin = QDoubleSpinBox()
         self.wait_time_spin.setRange(0.1, 120)
-        self.wait_time_spin.setValue(1.0)
+        self.wait_time_spin.setValue(3.0)
         self.wait_time_spin.setSingleStep(0.5)
         self.wait_time_spin.setDecimals(1)
         self.wait_time_spin.setToolTip("Wait time at live edge")
@@ -396,12 +397,30 @@ class ThorlabsGUI(QMainWindow):
         # self.show_napari_cb.setChecked(True)
         # roi_layout.addWidget(self.show_napari_cb, 2, 0)
         
-        # Manual update
-        self.update_roi_button = QPushButton("🔄 Update Metrics")
-        self.update_roi_button.clicked.connect(self.manual_roi_update)
-        roi_layout.addWidget(self.update_roi_button, 2, 0, 1, 2)
+        # Manual update (commented out - auto-update ROIs checkbox replaces this)
+        # self.update_roi_button = QPushButton("🔄 Update Metrics")
+        # self.update_roi_button.clicked.connect(self.manual_roi_update)
+        # roi_layout.addWidget(self.update_roi_button, 2, 0, 1, 2)
         
         left_layout.addWidget(roi_group)
+        
+        # Snapshot group (Average last N frames)
+        snapshot_group = QGroupBox("📸 Snapshot")
+        snapshot_layout = QHBoxLayout(snapshot_group)
+        
+        snapshot_layout.addWidget(QLabel("N frames:"))
+        self.avg_n_frames_spin = QSpinBox()
+        self.avg_n_frames_spin.setRange(1, 10000)
+        self.avg_n_frames_spin.setValue(100)
+        self.avg_n_frames_spin.setToolTip("Number of recent frames to average")
+        snapshot_layout.addWidget(self.avg_n_frames_spin)
+        
+        self.avg_button = QPushButton("📸 Average last frames")
+        self.avg_button.clicked.connect(self.average_last_n_frames)
+        self.avg_button.setToolTip("Average the last N acquired frames and display in Napari")
+        snapshot_layout.addWidget(self.avg_button)
+        
+        left_layout.addWidget(snapshot_group)
         
         # Control buttons
         control_group = QGroupBox("🎮 Controls")
@@ -605,12 +624,14 @@ class ThorlabsGUI(QMainWindow):
             self.viewer_backend = None
             self.napari_shapes_layer = None
         
-        # Validate folder
+        # Validate folder: need raw file + either Experiment.xml or any Chan*_Preview.tif
         raw_file = os.path.join(folder, "Image_001_001.raw")
-        preview_file = os.path.join(folder, "ChanC_Preview.tif")
+        has_xml = os.path.exists(os.path.join(folder, "Experiment.xml"))
+        has_preview = len(glob.glob(os.path.join(folder, "Chan*_Preview.tif"))) > 0
         
-        if os.path.exists(raw_file) and os.path.exists(preview_file):
-            self.log_status(f"✅ Selected: {os.path.basename(folder)}")
+        if os.path.exists(raw_file) and (has_xml or has_preview):
+            source = "XML" if has_xml else "Preview TIF"
+            self.log_status(f"✅ Selected: {os.path.basename(folder)} ({source})")
             self.start_button.setEnabled(True)
             self.napari_viewer.title = f"Viewer: {os.path.basename(folder)}"
             
@@ -767,6 +788,38 @@ class ThorlabsGUI(QMainWindow):
         if self.viewer_backend and hasattr(self.viewer_backend, 'array'):
              self.update_roi_plot(self.viewer_backend.array)
              self.log_status("Updated ROI Data")
+
+    def average_last_n_frames(self):
+        """Average the last N frames from the livestream and display in Napari"""
+        if not self.viewer_backend or not hasattr(self.viewer_backend, 'array'):
+            self.log_status("⚠️  No data loaded yet")
+            return
+        
+        data = self.viewer_backend.array
+        if data.size == 0:
+            self.log_status("⚠️  No frames acquired yet")
+            return
+        
+        n = self.avg_n_frames_spin.value()
+        total = data.shape[0]
+        n_actual = min(n, total)
+        
+        avg_frame = np.mean(data[-n_actual:], axis=0)
+        
+        # Add or update the averaged layer in Napari
+        layer_name = "Average (last N)"
+        existing = None
+        for layer in self.napari_viewer.layers:
+            if layer.name == layer_name:
+                existing = layer
+                break
+        
+        if existing is not None:
+            existing.data = avg_frame
+        else:
+            self.napari_viewer.add_image(avg_frame, name=layer_name)
+        
+        self.log_status(f"📸 Averaged last {n_actual} frames (of {total} total)")
 
     def on_data_ready(self, data):
         """Called when backend has new data ready"""

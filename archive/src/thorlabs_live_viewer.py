@@ -41,6 +41,7 @@ from skimage.io import imread
 # Constants
 FILENAME = 'Image_001_001.raw'
 PREVIEW_FILENAME = 'ChanC_Preview.tif'
+
 MAXCHUNKSIZE = 1024 * 288 * 2 * 3
 
 

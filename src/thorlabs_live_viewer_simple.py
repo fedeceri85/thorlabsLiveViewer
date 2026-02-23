@@ -17,9 +17,11 @@ import os
 import sys
 import threading
 import time
+import glob
 import numpy as np
 import argparse
 from os.path import getsize
+import xml.etree.ElementTree as ET
 from qtpy.QtCore import QTimer, QObject, Signal
 
 # Import GPU libraries
@@ -47,8 +49,41 @@ from skimage.io import imread
 
 # Constants
 FILENAME = 'Image_001_001.raw'
-PREVIEW_FILENAME = 'ChanC_Preview.tif'
 MAXCHUNKSIZE = 1024*288*2*3 # Max memory of the GPU
+
+
+def parse_experiment_xml(folder):
+    """Parse Experiment.xml to extract frame dimensions and rate.
+    
+    Returns:
+        dict with 'width', 'height', 'frame_rate' or None if not found.
+    """
+    xml_path = os.path.join(folder, 'Experiment.xml')
+    if not os.path.exists(xml_path):
+        return None
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        lsm = root.find('LSM')
+        if lsm is not None:
+            width = int(lsm.get('pixelX'))
+            height = int(lsm.get('pixelY'))
+            frame_rate = float(lsm.get('frameRate', 0))
+            return {'width': width, 'height': height, 'frame_rate': frame_rate}
+    except Exception as e:
+        print(f"⚠️  Error parsing Experiment.xml: {e}")
+    return None
+
+
+def find_preview_file(folder):
+    """Search for any ChanX_Preview.tif file (A, B, C, or D).
+    
+    Returns:
+        Path to the first matching preview file, or None.
+    """
+    pattern = os.path.join(folder, 'Chan*_Preview.tif')
+    matches = glob.glob(pattern)
+    return matches[0] if matches else None
 
 class DataUpdater(QObject):
     """Qt object for thread-safe communication"""
@@ -79,15 +114,26 @@ class ThorlabsLiveViewerSimple:
         
         self.folder = folder
         self.fullpath = os.path.join(self.folder, FILENAME)
+        self.frame_rate = 0.0
         
-        # Load preview to get dimensions
-        preview_path = os.path.join(self.folder, PREVIEW_FILENAME)
-        if not os.path.exists(preview_path):
-            raise FileNotFoundError(f"Preview file not found: {preview_path}")
-        
-        prev = imread(preview_path)
-        self.width = prev.shape[1]
-        self.height = prev.shape[0]
+        # Get frame dimensions: try Experiment.xml first, fall back to preview TIF
+        xml_meta = parse_experiment_xml(self.folder)
+        if xml_meta is not None:
+            self.width = xml_meta['width']
+            self.height = xml_meta['height']
+            self.frame_rate = xml_meta['frame_rate']
+            print(f"📄 Metadata from Experiment.xml: {self.width}x{self.height}, {self.frame_rate:.1f} fps")
+        else:
+            # Fallback: search for any ChanX_Preview.tif
+            preview_path = find_preview_file(self.folder)
+            if preview_path is None:
+                raise FileNotFoundError(
+                    f"No Experiment.xml or Chan*_Preview.tif found in {self.folder}"
+                )
+            prev = imread(preview_path)
+            self.width = prev.shape[1]
+            self.height = prev.shape[0]
+            print(f"📄 Dimensions from {os.path.basename(preview_path)}: {self.width}x{self.height}")
         
         # Open raw file
         if not os.path.exists(self.fullpath):
@@ -181,7 +227,7 @@ class ThorlabsLiveViewerSimple:
         # Basic processing (no GPU for simplicity)
         return stack
     
-    def start_live_monitoring(self, chunk_size=3, wait_time=0.3, use_gaussian_filter=True):
+    def start_live_monitoring(self, chunk_size=500, wait_time=3.0, use_gaussian_filter=True):
         """Start live monitoring with simple background thread"""
         if self.monitoring_active:
             print("⚠️  Monitoring already active")
@@ -372,7 +418,7 @@ class ThorlabsLiveViewerSimple:
             'remaining': remaining
         }
     
-    def restart_monitoring(self, chunk_size=3, wait_time=0.3, use_gaussian_filter=True):
+    def restart_monitoring(self, chunk_size=500, wait_time=3.0, use_gaussian_filter=True):
         """Restart monitoring with new parameters"""
         self.stop_monitoring()
         time.sleep(0.5)  # Brief pause

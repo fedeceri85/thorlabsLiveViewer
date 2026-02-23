@@ -83,3 +83,9 @@ The application requires a specific folder structure for each recording session:
 ├── archive/                   # Historical/Unused code
 └── ...
 ```
+
+## 8. TODO
+- ~~The preview file name can either be named 'ChanC_Preview.tif' or ChanA_Preview.tif (B and D also possible). Change the code to look for which one is available. Better still, load the Experiment.xml file and extract the metadata from there: pixelX, pixelY and frameRate (see example xml file in root folder)~~ ✅ Done — `parse_experiment_xml()` reads `Experiment.xml` first, falls back to any `Chan*_Preview.tif`
+- ~~Remove ROI monitor altogether if automatic is good enough.~~ ✅ Done — Manual "Update Metrics" button commented out; auto-update checkbox added
+- ~~Change chunk size default to 500 and wait time to 3 s.~~ ✅ Done — Defaults changed in both GUI and backend
+- In the future, add the possibility to determine the best parameters based on the frame rate of the recording. E.g., with 20 fps, 500 chunk and 3s wait is ok.
