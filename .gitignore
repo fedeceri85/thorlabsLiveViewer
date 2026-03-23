@@ -13,3 +13,4 @@ venv/
 __pycache__/
 *.pyc
 requirements.txt
+GEMINI.md
