@@ -23,19 +23,21 @@
 
 ### 2.3 Data Structure
 The application requires a specific folder structure for each recording session:
-- **`Image_001_001.raw`**: A growing binary file containing raw 2D frames (uint16).
-- **`ChanC_Preview.tif`**: A static preview image used to ascertain frame dimensions (width/height).
+- **`Image_001_001.raw`**: A growing binary file containing raw 2D frames (uint16). In multi-channel experiments, frames from different channels are interleaved (even indices = Ch1, odd indices = Ch2).
+- **`ChanX_Preview.tif`** (where X is A, B, C, or D): Static preview image(s) used to ascertain frame dimensions (width/height). The **number of preview files** determines the channel count (1 or 2 channels supported).
 
 ## 3. Architecture & Data Flow
 1.  **Initialization**: User launches `thorlabs_gui_app.py`, which sets up the Qt application and Napari viewer.
-2.  **Configuration**: User selects a data folder. The app validates the existence of `Image_001_001.raw` and `ChanC_Preview.tif`.
-3.  ** monitoring Loop**:
+2.  **Configuration**: User selects a data folder. The app validates the existence of `Image_001_001.raw` and at least one `ChanX_Preview.tif` (or `Experiment.xml`).
+3.  **Channel Detection**: The number of `ChanX_Preview.tif` files determines single- or dual-channel mode (max 2).
+4.  **Monitoring Loop**:
     - A background thread (managed by `ThorlabsLiveViewerSimple`) continuously checks the size of the raw file.
-    - New frames are read in `Chunk Size` blocks.
-    - Data is processed (e.g., Gaussian filter) and emitted via a thread-safe Qt Signal.
-4.  **Visualization**:
-    - The main GUI thread receives the signal and updates the Napari `Live Stream` layer.
-    - If ROI plotting is enabled, mean intensity values are extracted and plotted in real-time.
+    - New frames are read in `Chunk Size` blocks (logical frames, each spanning `num_channels` raw frames).
+    - Frames are deinterleaved per channel, then each channel is processed independently (e.g., Gaussian filter).
+    - Per-channel data is emitted via a thread-safe Qt Signal as a `dict`.
+5.  **Visualization**:
+    - The main GUI thread receives the signal and updates separate Napari layers (`Ch1`, `Ch2`).
+    - If ROI plotting is enabled, mean intensity values are extracted from the selected channel and plotted in real-time. A dropdown selects the target channel.
 
 ## 4. Key Libraries & Dependencies
 - **Core**: `python` (3.8+), `numpy`.

@@ -33,7 +33,7 @@ from qtpy.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QLabel, QPushButton, QLineEdit, 
                            QSpinBox, QDoubleSpinBox, QFileDialog, QTextEdit,
                            QGroupBox, QGridLayout, QMessageBox, QProgressBar,
-                           QCheckBox, QTabWidget, QSplitter)
+                           QCheckBox, QTabWidget, QSplitter, QComboBox)
 from qtpy.QtCore import QTimer, QObject, Signal, Qt, QFileSystemWatcher
 from qtpy.QtGui import QFont, QIcon, QPalette
 
@@ -329,7 +329,6 @@ class ThorlabsGUI(QMainWindow):
         
         # Row 2: Experiment Dropdown
         folder_layout.addWidget(QLabel("Experiment:"), 1, 0)
-        from qtpy.QtWidgets import QComboBox
         self.experiment_combo = QComboBox()
         self.experiment_combo.setPlaceholderText("Select experiment...")
         self.experiment_combo.currentIndexChanged.connect(self.on_experiment_selected)
@@ -386,21 +385,33 @@ class ThorlabsGUI(QMainWindow):
         self.auto_roi_checkbox.setToolTip("Update ROI plot automatically when new frames arrive")
         roi_layout.addWidget(self.auto_roi_checkbox, 0, 1)
         
+        # Channel selector for ROI computation
+        roi_layout.addWidget(QLabel("ROI Channel:"), 2, 0)
+        self.roi_channel_combo = QComboBox()
+        self.roi_channel_combo.addItem("Ch1")
+        self.roi_channel_combo.setToolTip("Select which channel to compute ROI intensities on")
+        self.roi_channel_combo.currentIndexChanged.connect(self._on_roi_channel_changed)
+        roi_layout.addWidget(self.roi_channel_combo, 2, 1)
+        # Hide channel selector by default (single channel)
+        self.roi_channel_label = roi_layout.itemAtPosition(2, 0).widget()
+        self.roi_channel_label.setVisible(False)
+        self.roi_channel_combo.setVisible(False)
+        
         # Info label
         roi_info = QLabel("Draw shapes in Napari to create ROIs")
         roi_info.setStyleSheet("color: #aaaaaa; font-style: italic; font-size: 10px")
         roi_info.setWordWrap(True)
-        roi_layout.addWidget(roi_info, 1, 0, 1, 2)
+        roi_layout.addWidget(roi_info, 3, 0, 1, 2)
         
         # Checkboxes for toggling Napari Layers (optional future feature)
         # self.show_napari_cb = QCheckBox("Show Napari")
         # self.show_napari_cb.setChecked(True)
-        # roi_layout.addWidget(self.show_napari_cb, 2, 0)
+        # roi_layout.addWidget(self.show_napari_cb, 4, 0)
         
         # Manual update (commented out - auto-update ROIs checkbox replaces this)
         # self.update_roi_button = QPushButton("🔄 Update Metrics")
         # self.update_roi_button.clicked.connect(self.manual_roi_update)
-        # roi_layout.addWidget(self.update_roi_button, 2, 0, 1, 2)
+        # roi_layout.addWidget(self.update_roi_button, 4, 0, 1, 2)
         
         left_layout.addWidget(roi_group)
         
@@ -664,6 +675,9 @@ class ThorlabsGUI(QMainWindow):
             self.log_status(f"Started: Chunk={chunk_size}")
             self.viewer_backend.start_live_monitoring(chunk_size, wait_time, use_gaussian_filter=use_gaussian)
 
+            # Populate channel dropdown
+            self._populate_channel_dropdown()
+
             # Connect backend data signal to ROI update logic
             self.viewer_backend.updater.data_ready.connect(self.on_data_ready)
 
@@ -729,6 +743,31 @@ class ThorlabsGUI(QMainWindow):
         else:
             self.log_status("ROI Plot Disabled")
     
+    def _populate_channel_dropdown(self):
+        """Populate ROI channel dropdown from the backend's channel list."""
+        if not self.viewer_backend:
+            return
+        ch_names = self.viewer_backend.channel_names
+        self.roi_channel_combo.blockSignals(True)
+        self.roi_channel_combo.clear()
+        self.roi_channel_combo.addItems(ch_names)
+        self.roi_channel_combo.blockSignals(False)
+        
+        multi = len(ch_names) > 1
+        self.roi_channel_label.setVisible(multi)
+        self.roi_channel_combo.setVisible(multi)
+    
+    def _on_roi_channel_changed(self, index):
+        """Handle ROI channel selection change — trigger full recalculation."""
+        self.roi_dirty = True
+        self.last_roi_frame_index = 0
+        self.roi_data = {}
+        # Immediately recalculate with current data if available
+        if self.viewer_backend and hasattr(self.viewer_backend, 'arrays'):
+            selected_ch = self.roi_channel_combo.currentText()
+            if selected_ch in self.viewer_backend.arrays:
+                self.update_roi_plot(self.viewer_backend.arrays[selected_ch])
+    
     def connect_to_napari_shapes(self):
         """Connect to Napari's shapes layer for ROI monitoring"""
         # (Simplified logic - re-uses existing robust connection logic ideally)
@@ -785,47 +824,61 @@ class ThorlabsGUI(QMainWindow):
             
     def manual_roi_update(self):
         """Manually update ROI data"""
-        if self.viewer_backend and hasattr(self.viewer_backend, 'array'):
-             self.update_roi_plot(self.viewer_backend.array)
+        if self.viewer_backend and hasattr(self.viewer_backend, 'arrays'):
+             selected_ch = self.roi_channel_combo.currentText()
+             if selected_ch in self.viewer_backend.arrays:
+                 self.update_roi_plot(self.viewer_backend.arrays[selected_ch])
              self.log_status("Updated ROI Data")
 
     def average_last_n_frames(self):
         """Average the last N frames from the livestream and display in Napari"""
-        if not self.viewer_backend or not hasattr(self.viewer_backend, 'array'):
+        if not self.viewer_backend or not hasattr(self.viewer_backend, 'arrays'):
             self.log_status("⚠️  No data loaded yet")
             return
         
-        data = self.viewer_backend.array
-        if data.size == 0:
-            self.log_status("⚠️  No frames acquired yet")
-            return
-        
         n = self.avg_n_frames_spin.value()
-        total = data.shape[0]
-        n_actual = min(n, total)
         
-        avg_frame = np.mean(data[-n_actual:], axis=0)
+        for ch_name, data in self.viewer_backend.arrays.items():
+            if data.size == 0:
+                continue
+            total = data.shape[0]
+            n_actual = min(n, total)
+            
+            avg_frame = np.mean(data[-n_actual:], axis=0)
+            
+            # Add or update the averaged layer in Napari
+            layer_name = f"Average (last N) - {ch_name}"
+            existing = None
+            for layer in self.napari_viewer.layers:
+                if layer.name == layer_name:
+                    existing = layer
+                    break
+            
+            _ch_colormaps = {'Ch1': 'green', 'Ch2': 'red'}
+            cmap = _ch_colormaps.get(ch_name, 'gray')
+            if existing is not None:
+                existing.data = avg_frame
+            else:
+                self.napari_viewer.add_image(
+                    avg_frame, name=layer_name,
+                    colormap=cmap, blending='additive'
+                )
         
-        # Add or update the averaged layer in Napari
-        layer_name = "Average (last N)"
-        existing = None
-        for layer in self.napari_viewer.layers:
-            if layer.name == layer_name:
-                existing = layer
-                break
-        
-        if existing is not None:
-            existing.data = avg_frame
-        else:
-            self.napari_viewer.add_image(avg_frame, name=layer_name)
-        
-        self.log_status(f"📸 Averaged last {n_actual} frames (of {total} total)")
+        total_frames = self.viewer_backend.arrays[self.viewer_backend.channel_names[0]].shape[0]
+        n_actual = min(n, total_frames)
+        self.log_status(f"📸 Averaged last {n_actual} frames (of {total_frames} total)")
 
     def on_data_ready(self, data):
-        """Called when backend has new data ready"""
+        """Called when backend has new data ready.
+        
+        Args:
+            data: dict mapping channel name to np.ndarray stack.
+        """
         if self.roi_enabled and self.auto_roi_checkbox.isChecked():
-            # Trigger ROI update with the new data stack
-            self.update_roi_plot(data)
+            # Get the selected channel for ROI computation
+            selected_ch = self.roi_channel_combo.currentText()
+            if selected_ch in data:
+                self.update_roi_plot(data[selected_ch])
 
     def update_roi_plot(self, image_data):
         """Update ROI plot with new data"""

@@ -75,19 +75,19 @@ def parse_experiment_xml(folder):
     return None
 
 
-def find_preview_file(folder):
-    """Search for any ChanX_Preview.tif file (A, B, C, or D).
+def find_preview_files(folder):
+    """Search for all ChanX_Preview.tif files (A, B, C, or D).
     
     Returns:
-        Path to the first matching preview file, or None.
+        Sorted list of matching preview file paths (may be empty).
     """
     pattern = os.path.join(folder, 'Chan*_Preview.tif')
-    matches = glob.glob(pattern)
-    return matches[0] if matches else None
+    matches = sorted(glob.glob(pattern))
+    return matches
 
 class DataUpdater(QObject):
     """Qt object for thread-safe communication"""
-    data_ready = Signal(np.ndarray)
+    data_ready = Signal(dict)
 
 
 class ThorlabsLiveViewerSimple:
@@ -116,6 +116,11 @@ class ThorlabsLiveViewerSimple:
         self.fullpath = os.path.join(self.folder, FILENAME)
         self.frame_rate = 0.0
         
+        # Detect number of channels from preview files
+        preview_files = find_preview_files(self.folder)
+        self.num_channels = min(len(preview_files), 2) if preview_files else 1
+        self.channel_names = [f"Ch{i+1}" for i in range(self.num_channels)]
+        
         # Get frame dimensions: try Experiment.xml first, fall back to preview TIF
         xml_meta = parse_experiment_xml(self.folder)
         if xml_meta is not None:
@@ -124,16 +129,17 @@ class ThorlabsLiveViewerSimple:
             self.frame_rate = xml_meta['frame_rate']
             print(f"📄 Metadata from Experiment.xml: {self.width}x{self.height}, {self.frame_rate:.1f} fps")
         else:
-            # Fallback: search for any ChanX_Preview.tif
-            preview_path = find_preview_file(self.folder)
-            if preview_path is None:
+            # Fallback: use first preview TIF for dimensions
+            if not preview_files:
                 raise FileNotFoundError(
                     f"No Experiment.xml or Chan*_Preview.tif found in {self.folder}"
                 )
-            prev = imread(preview_path)
+            prev = imread(preview_files[0])
             self.width = prev.shape[1]
             self.height = prev.shape[0]
-            print(f"📄 Dimensions from {os.path.basename(preview_path)}: {self.width}x{self.height}")
+            print(f"📄 Dimensions from {os.path.basename(preview_files[0])}: {self.width}x{self.height}")
+        
+        print(f"📡 Channels detected: {self.num_channels} ({', '.join(self.channel_names)})")
         
         # Open raw file
         if not os.path.exists(self.fullpath):
@@ -142,13 +148,14 @@ class ThorlabsLiveViewerSimple:
         self.r = open(self.fullpath, 'rb')
         nbytes = getsize(self.fullpath)
         self.frameSize = self.width * self.height * 2
-        self.nFrames = int(nbytes / self.frameSize)
+        # Each "logical frame" consists of num_channels raw frames
+        self.nFrames = int(nbytes / (self.frameSize * self.num_channels))
         
-        print(f"📊 File info: {self.width}x{self.height}, {self.nFrames} frames ({nbytes/1024/1024:.1f} MB)")
+        print(f"📊 File info: {self.width}x{self.height}, {self.nFrames} logical frames ({nbytes/1024/1024:.1f} MB)")
         
-        # Initialize data arrays
+        # Initialize per-channel data arrays
         self.currentLastFrame = 0
-        self.array = np.empty((0, self.height, self.width), dtype=np.uint16)
+        self.arrays = {ch: np.empty((0, self.height, self.width), dtype=np.uint16) for ch in self.channel_names}
         
         # Threading control
         self.stop_flag = threading.Event()
@@ -169,7 +176,7 @@ class ThorlabsLiveViewerSimple:
              self.app = napari.Viewer(title=f"Simple Thorlabs Live Viewer - {os.path.basename(folder)}")
              print("✨ Created new Napari viewer")
              
-        self.image_layer = None
+        self.image_layers = {ch: None for ch in self.channel_names}
         self._setup_napari_layers()
 
         
@@ -204,27 +211,35 @@ class ThorlabsLiveViewerSimple:
         return nparray
     
     def loadFrameChunk(self, start, end):
-        """Load a chunk of frames (simplified)"""
+        """Load a chunk of logical frames.
+        
+        Each logical frame consists of self.num_channels raw frames.
+        Returns a stack of raw frames (num_channels * logical_frames, H, W).
+        """
         if start >= end or start < 0 or end > self.nFrames:
             return None
         
-        totalFrames = end - start
-        totalFramesSize = totalFrames * self.frameSize
+        totalLogicalFrames = end - start
+        totalRawFrames = totalLogicalFrames * self.num_channels
+        totalFramesSize = totalRawFrames * self.frameSize
         
-        offset = start * self.frameSize
+        # Offset in bytes: each logical frame = num_channels raw frames
+        offset = start * self.num_channels * self.frameSize
         self.r.seek(offset)
         st = self.r.read(totalFramesSize)
         
         if len(st) < totalFramesSize:
-            # Partial read
-            actual_frames = len(st) // self.frameSize
-            if actual_frames == 0:
+            # Partial read — ensure we have complete logical frames
+            actual_raw = len(st) // self.frameSize
+            actual_logical = actual_raw // self.num_channels
+            if actual_logical == 0:
                 return None
-            totalFrames = actual_frames
+            totalRawFrames = actual_logical * self.num_channels
         
-        stack = np.frombuffer(st, dtype=np.uint16).reshape((totalFrames, self.height, self.width))
+        stack = np.frombuffer(st[:totalRawFrames * self.frameSize], dtype=np.uint16).reshape(
+            (totalRawFrames, self.height, self.width)
+        )
         
-        # Basic processing (no GPU for simplicity)
         return stack
     
     def start_live_monitoring(self, chunk_size=500, wait_time=3.0, use_gaussian_filter=True):
@@ -251,6 +266,8 @@ class ThorlabsLiveViewerSimple:
             """Simple background monitoring thread"""
             current_frame = self.currentLastFrame
             consecutive_zeros = 0
+            num_ch = self.num_channels
+            ch_names = self.channel_names
             
             print("🚀 Simple monitoring thread started")
             
@@ -261,7 +278,7 @@ class ThorlabsLiveViewerSimple:
                         print("🏁 Reached end of allocated file space")
                         break
                     
-                    # Load next chunk
+                    # Load next chunk (in raw frames, covering logical frames)
                     end_frame = min(current_frame + chunk_size, self.nFrames)
                     new_block = self.loadFrameChunk(current_frame, end_frame)
                     
@@ -269,7 +286,7 @@ class ThorlabsLiveViewerSimple:
                         time.sleep(wait_time)
                         continue
                     
-                    # Check for black frames (live edge)
+                    # Check for black frames (live edge) — check on raw frames
                     zero_idx = None
                     for i, frame in enumerate(new_block):
                         if np.all(frame == 0):
@@ -278,47 +295,62 @@ class ThorlabsLiveViewerSimple:
                     found_zeros = False
                     if zero_idx is not None:
                         if zero_idx > 0:
-                            # Partial data
-                            new_block = new_block[:zero_idx]
+                            # Truncate to complete logical frames before the zero
+                            complete_logical = zero_idx // num_ch
+                            if complete_logical == 0:
+                                consecutive_zeros += 1
+                                if consecutive_zeros % 10 == 1:
+                                    print(f"⏸️  At live edge (frame {current_frame}) - waiting {wait_time:.1f}s...")
+                                time.sleep(wait_time)
+                                continue
+                            new_block = new_block[:complete_logical * num_ch]
                             consecutive_zeros = 0
                             found_zeros = True
                         else:
                             # All black frames - at live edge
                             consecutive_zeros += 1
-                            if consecutive_zeros % 10 == 1:  # Log every 10th attempt
+                            if consecutive_zeros % 10 == 1:
                                 print(f"⏸️  At live edge (frame {current_frame}) - waiting {wait_time:.1f}s...")
                             time.sleep(wait_time)
                             continue
                     else:
                         consecutive_zeros = 0
                     
+                    # Deinterleave into per-channel blocks
+                    channel_blocks = {}
+                    for ch_idx, ch_name in enumerate(ch_names):
+                        channel_blocks[ch_name] = new_block[ch_idx::num_ch]
+                    
+                    # Number of logical frames in this chunk
+                    logical_loaded = channel_blocks[ch_names[0]].shape[0]
+                    
                     # Update data arrays (thread-safe)
-                    if new_block.size > 0:
+                    if logical_loaded > 0:
                         with self.data_lock:
-                            if self.use_gaussian_filter:
-                                if sys.platform != 'darwin' and HAS_CUPY:
-                                    # GPU processing path
-                                    new_block2 = cp.asarray(new_block, dtype=np.uint16)
-                                    new_block_filtered = gaussian_filter(new_block2, (2,2,2))
-                                    new_block = cp.asnumpy(new_block_filtered)
-                                    
-                                    # Explicitly free GPU memory
-                                    del new_block2, new_block_filtered
-                                    cp.get_default_memory_pool().free_all_blocks()
-                                else:
-                                    # CPU processing path
-                                    new_block = gaussian_filter(new_block, (2,2,2))
-                            # If Gaussian filter is disabled, use raw data as-is
+                            for ch_name in ch_names:
+                                ch_block = channel_blocks[ch_name]
+                                if self.use_gaussian_filter:
+                                    if sys.platform != 'darwin' and HAS_CUPY:
+                                        # GPU processing path
+                                        ch_block_gpu = cp.asarray(ch_block, dtype=np.uint16)
+                                        ch_block_filtered = gaussian_filter(ch_block_gpu, (2,2,2))
+                                        ch_block = cp.asnumpy(ch_block_filtered)
+                                        del ch_block_gpu, ch_block_filtered
+                                        cp.get_default_memory_pool().free_all_blocks()
+                                    else:
+                                        # CPU processing path
+                                        ch_block = gaussian_filter(ch_block, (2,2,2))
+                                
+                                self.arrays[ch_name] = np.vstack([self.arrays[ch_name], ch_block])
                             
-                            self.array = np.vstack([self.array, new_block])
-                            current_frame += new_block.shape[0]
-                            self.currentLastFrame = self.array.shape[0]
-                            data_copy = self.array.copy()
+                            current_frame += logical_loaded
+                            self.currentLastFrame = self.arrays[ch_names[0]].shape[0]
+                            data_copy = {ch: arr.copy() for ch, arr in self.arrays.items()}
                         
                         # Signal GUI update (thread-safe Qt signal)
                         self.updater.data_ready.emit(data_copy)
                         
-                        print(f"📈 Loaded {new_block.shape[0]} frames, total: {self.currentLastFrame}")
+                        print(f"📈 Loaded {logical_loaded} logical frames, total: {self.currentLastFrame}")
                     
                     # Small pause to prevent overload
                     time.sleep(0.05)
@@ -342,14 +374,25 @@ class ThorlabsLiveViewerSimple:
         print("✅ Live monitoring started! Press Ctrl+C to stop")
     
     def _update_viewer_main_thread(self, data):
-        """Update viewer on main thread via Qt signal"""
+        """Update viewer on main thread via Qt signal.
+        
+        Args:
+            data: dict mapping channel name to np.ndarray stack.
+        """
+        # Colormap defaults per channel
+        _ch_colormaps = {'Ch1': 'green', 'Ch2': 'red'}
         try:
-            if self.image_layer is None:
-                # Create layer first time
-                self.image_layer = self.app.add_image(data, name='Live Stream')
-            else:
-                # Update existing layer
-                self.image_layer.data = data
+            for ch_name, ch_data in data.items():
+                if self.image_layers[ch_name] is None:
+                    # Create layer first time
+                    cmap = _ch_colormaps.get(ch_name, 'gray')
+                    self.image_layers[ch_name] = self.app.add_image(
+                        ch_data, name=ch_name,
+                        colormap=cmap, blending='additive'
+                    )
+                else:
+                    # Update existing layer
+                    self.image_layers[ch_name].data = ch_data
                 
         except Exception as e:
             print(f"⚠️  Viewer update error: {e}")
@@ -358,18 +401,19 @@ class ThorlabsLiveViewerSimple:
         """Reset data arrays for fresh monitoring session"""
         with self.data_lock:
             self.currentLastFrame = 0
-            self.array = np.empty((0, self.height, self.width), dtype=np.uint16)
+            self.arrays = {ch: np.empty((0, self.height, self.width), dtype=np.uint16) for ch in self.channel_names}
             
-            # Check if Live Stream layer already exists and reuse it
-            self.image_layer = None
-            for layer in self.app.layers:
-                if layer.name == 'Live Stream':
-                    self.image_layer = layer
-                    print("🔄 Reusing existing 'Live Stream' layer")
-                    break
-            
-            if self.image_layer is None:
-                print("🔄 No existing 'Live Stream' layer found - will create new one")
+            # Check if channel layers already exist and reuse them
+            for ch_name in self.channel_names:
+                self.image_layers[ch_name] = None
+                for layer in self.app.layers:
+                    if layer.name == ch_name:
+                        self.image_layers[ch_name] = layer
+                        print(f"🔄 Reusing existing '{ch_name}' layer")
+                        break
+                
+                if self.image_layers[ch_name] is None:
+                    print(f"🔄 No existing '{ch_name}' layer found - will create new one")
                 
         print("🔄 Data arrays reset for new monitoring session")
     
