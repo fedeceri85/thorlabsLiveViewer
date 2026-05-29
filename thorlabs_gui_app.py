@@ -384,16 +384,23 @@ class ThorlabsGUI(QMainWindow):
         self.auto_roi_checkbox.setChecked(True)
         self.auto_roi_checkbox.setToolTip("Update ROI plot automatically when new frames arrive")
         roi_layout.addWidget(self.auto_roi_checkbox, 0, 1)
+
+        # dF/F0 checkbox
+        self.dfof_checkbox = QCheckBox("Show dF/F\u2080")
+        self.dfof_checkbox.setChecked(False)
+        self.dfof_checkbox.setToolTip("Display traces as dF/F\u2080 (F0 = mean of first 100 frames)")
+        self.dfof_checkbox.toggled.connect(self._on_dfof_toggled)
+        roi_layout.addWidget(self.dfof_checkbox, 1, 0, 1, 2)
         
         # Channel selector for ROI computation
-        roi_layout.addWidget(QLabel("ROI Channel:"), 2, 0)
+        roi_layout.addWidget(QLabel("ROI Channel:"), 3, 0)
         self.roi_channel_combo = QComboBox()
         self.roi_channel_combo.addItem("Ch1")
         self.roi_channel_combo.setToolTip("Select which channel to compute ROI intensities on")
         self.roi_channel_combo.currentIndexChanged.connect(self._on_roi_channel_changed)
-        roi_layout.addWidget(self.roi_channel_combo, 2, 1)
+        roi_layout.addWidget(self.roi_channel_combo, 3, 1)
         # Hide channel selector by default (single channel)
-        self.roi_channel_label = roi_layout.itemAtPosition(2, 0).widget()
+        self.roi_channel_label = roi_layout.itemAtPosition(3, 0).widget()
         self.roi_channel_label.setVisible(False)
         self.roi_channel_combo.setVisible(False)
         
@@ -401,7 +408,7 @@ class ThorlabsGUI(QMainWindow):
         roi_info = QLabel("Draw shapes in Napari to create ROIs")
         roi_info.setStyleSheet("color: #aaaaaa; font-style: italic; font-size: 10px")
         roi_info.setWordWrap(True)
-        roi_layout.addWidget(roi_info, 3, 0, 1, 2)
+        roi_layout.addWidget(roi_info, 4, 0, 1, 2)
         
         # Checkboxes for toggling Napari Layers (optional future feature)
         # self.show_napari_cb = QCheckBox("Show Napari")
@@ -767,6 +774,34 @@ class ThorlabsGUI(QMainWindow):
             selected_ch = self.roi_channel_combo.currentText()
             if selected_ch in self.viewer_backend.arrays:
                 self.update_roi_plot(self.viewer_backend.arrays[selected_ch])
+
+    def _on_dfof_toggled(self, enabled):
+        """Handle dF/F0 toggle — replot from stored raw data without re-extracting pixels."""
+        self.roi_plot_widget.setLabel('left', 'dF/F\u2080' if enabled else 'Mean Intensity', units='' if enabled else 'AU')
+        self._replot_roi_data()
+
+    def _replot_roi_data(self):
+        """Replot stored raw ROI data, applying dF/F0 transform if checkbox is checked."""
+        if not self.roi_data:
+            return
+        use_dfof = self.dfof_checkbox.isChecked()
+        self.roi_plot_widget.clear()
+        for roi_name, raw in self.roi_data.items():
+            if not raw:
+                continue
+            if roi_name not in self.roi_color_map:
+                continue
+            color = self.roi_color_map[roi_name]
+            if use_dfof:
+                arr = np.array(raw, dtype=float)
+                f0 = np.mean(arr[:100]) if len(arr) >= 100 else np.mean(arr)
+                if f0 != 0:
+                    y = (arr - f0) / f0
+                else:
+                    y = arr - f0
+            else:
+                y = raw
+            self.roi_plot_widget.plot(y, pen=pg.mkPen(color, width=2), name=roi_name)
     
     def connect_to_napari_shapes(self):
         """Connect to Napari's shapes layer for ROI monitoring"""
@@ -981,12 +1016,7 @@ class ThorlabsGUI(QMainWindow):
             self.last_roi_frame_index = total_frames
             
             # Update plot
-            self.roi_plot_widget.clear()
-            for roi_name, data in self.roi_data.items():
-                if roi_name in self.roi_color_map:
-                    color = self.roi_color_map[roi_name]
-                    # Plot full history
-                    self.roi_plot_widget.plot(data, pen=pg.mkPen(color, width=2), name=roi_name)
+            self._replot_roi_data()
                     
         except Exception as e:
             # print(f"ROI Update Error: {e}")
