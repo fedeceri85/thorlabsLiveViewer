@@ -404,11 +404,17 @@ class ThorlabsGUI(QMainWindow):
         self.roi_channel_label.setVisible(False)
         self.roi_channel_combo.setVisible(False)
         
+        # Detach button
+        self.detach_plot_button = QPushButton("⧉ Detach Plot")
+        self.detach_plot_button.setToolTip("Pop the ROI plot into a separate floating window")
+        self.detach_plot_button.clicked.connect(self.toggle_detach_roi_plot)
+        roi_layout.addWidget(self.detach_plot_button, 4, 0, 1, 2)
+
         # Info label
         roi_info = QLabel("Draw shapes in Napari to create ROIs")
         roi_info.setStyleSheet("color: #aaaaaa; font-style: italic; font-size: 10px")
         roi_info.setWordWrap(True)
-        roi_layout.addWidget(roi_info, 4, 0, 1, 2)
+        roi_layout.addWidget(roi_info, 5, 0, 1, 2)
         
         # Checkboxes for toggling Napari Layers (optional future feature)
         # self.show_napari_cb = QCheckBox("Show Napari")
@@ -528,6 +534,8 @@ class ThorlabsGUI(QMainWindow):
         self.roi_plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.roi_plot_widget.addLegend()
         self.roi_curves = {}
+        self.plot_detached = False  # Track detached state
+        self._detached_plot_window = None  # Floating window reference
         
         self.right_splitter.addWidget(self.roi_plot_widget)
         
@@ -764,6 +772,58 @@ class ThorlabsGUI(QMainWindow):
         self.roi_channel_label.setVisible(multi)
         self.roi_channel_combo.setVisible(multi)
     
+    def toggle_detach_roi_plot(self):
+        """Toggle the ROI plot between embedded and floating window."""
+        if not self.plot_detached:
+            self.detach_roi_plot()
+        else:
+            self.attach_roi_plot()
+
+    def detach_roi_plot(self):
+        """Pop the ROI plot out into a standalone floating window."""
+        if self.plot_detached:
+            return
+        self.plot_detached = True
+        self.detach_plot_button.setText("⊡ Attach Plot")
+
+        # Remove from splitter (hides the widget slot)
+        self.roi_plot_widget.setParent(None)
+
+        # Create a lightweight container window
+        self._detached_plot_window = QWidget()
+        self._detached_plot_window.setWindowTitle("ROI Intensities")
+        self._detached_plot_window.setGeometry(200, 200, 800, 400)
+        self._detached_plot_window.setStyleSheet(
+            "background-color: #1e1e1e; color: #ffffff;"
+        )
+        layout = QVBoxLayout(self._detached_plot_window)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(self.roi_plot_widget)
+
+        # Re-attach when the user closes the window
+        self._detached_plot_window.closeEvent = lambda event: (
+            self.attach_roi_plot(), event.accept()
+        )
+        self._detached_plot_window.show()
+
+    def attach_roi_plot(self):
+        """Re-embed the ROI plot back into the main splitter."""
+        if not self.plot_detached:
+            return
+        self.plot_detached = False
+        self.detach_plot_button.setText("⧉ Detach Plot")
+
+        # Take the widget back from the floating window
+        self.roi_plot_widget.setParent(None)
+        self.right_splitter.addWidget(self.roi_plot_widget)
+        self.right_splitter.setSizes([600, 300])
+
+        # Close and discard the floating window without triggering closeEvent again
+        if self._detached_plot_window is not None:
+            self._detached_plot_window.closeEvent = lambda event: event.accept()
+            self._detached_plot_window.close()
+            self._detached_plot_window = None
+
     def _on_roi_channel_changed(self, index):
         """Handle ROI channel selection change — trigger full recalculation."""
         self.roi_dirty = True
