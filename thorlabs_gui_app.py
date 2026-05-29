@@ -327,13 +327,33 @@ class ThorlabsGUI(QMainWindow):
         self.browse_button.clicked.connect(self.browse_root_folder)
         folder_layout.addWidget(self.browse_button, 0, 2)
         
-        # Row 2: Experiment Dropdown
-        folder_layout.addWidget(QLabel("Experiment:"), 1, 0)
+        # Row 2: Acquisition mode toggle
+        from qtpy.QtWidgets import QButtonGroup, QRadioButton
+        mode_label = QLabel("Mode:")
+        folder_layout.addWidget(mode_label, 1, 0)
+        mode_widget = QWidget()
+        mode_layout = QHBoxLayout(mode_widget)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.live_mode_radio = QRadioButton("🔴 Live")
+        self.offline_mode_radio = QRadioButton("📂 Offline")
+        self.live_mode_radio.setChecked(True)
+        self.live_mode_radio.setToolTip("Monitor a running acquisition in real time")
+        self.offline_mode_radio.setToolTip("Load a completed acquisition all at once")
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self.live_mode_radio)
+        self._mode_group.addButton(self.offline_mode_radio)
+        self._mode_group.buttonToggled.connect(self._on_mode_changed)
+        mode_layout.addWidget(self.live_mode_radio)
+        mode_layout.addWidget(self.offline_mode_radio)
+        folder_layout.addWidget(mode_widget, 1, 1, 1, 2)
+
+        # Row 3: Experiment Dropdown
+        folder_layout.addWidget(QLabel("Experiment:"), 2, 0)
         self.experiment_combo = QComboBox()
         self.experiment_combo.setPlaceholderText("Select experiment...")
         self.experiment_combo.currentIndexChanged.connect(self.on_experiment_selected)
-        folder_layout.addWidget(self.experiment_combo, 1, 1, 1, 2)
-        
+        folder_layout.addWidget(self.experiment_combo, 2, 1, 1, 2)
+
         left_layout.addWidget(folder_group)
 
         # File watcher for refreshing experiment list
@@ -466,7 +486,7 @@ class ThorlabsGUI(QMainWindow):
         self.restart_button.clicked.connect(self.restart_monitoring)
         self.restart_button.setEnabled(False)
         control_layout.addWidget(self.restart_button)
-        
+
         left_layout.addWidget(control_group)
         
         # Progress group
@@ -660,72 +680,135 @@ class ThorlabsGUI(QMainWindow):
             self.log_status(f"✅ Selected: {os.path.basename(folder)} ({source})")
             self.start_button.setEnabled(True)
             self.napari_viewer.title = f"Viewer: {os.path.basename(folder)}"
-            
-            # Auto-start monitoring? optional.
-            # self.start_monitoring() 
         else:
             self.log_status(f"⚠️  Waiting for files in {os.path.basename(folder)}...")
             self.start_button.setEnabled(False)
     
+    def _on_mode_changed(self, button, checked):
+        """Grey out Wait Time when offline mode is selected."""
+        if not checked:
+            return
+        live = self.live_mode_radio.isChecked()
+        self.wait_time_spin.setEnabled(live)
+        self.start_button.setText("🚀 Start" if live else "📂 Load All")
+
+    def _set_mode_controls_enabled(self, enabled):
+        """Enable or disable the Live/Offline toggle (lock it while monitoring)."""
+        self.live_mode_radio.setEnabled(enabled)
+        self.offline_mode_radio.setEnabled(enabled)
+
     def start_monitoring(self):
-        """Start live monitoring"""
+        """Start live monitoring or load a finished file, depending on mode."""
         if not self.current_folder:
             return
-        
+        if self.offline_mode_radio.isChecked():
+            self._start_offline()
+        else:
+            self._start_live()
+
+    def _start_live(self):
+        """Start live monitoring."""
         try:
-            # Initialize backend if needed
             if self.viewer_backend is None:
                 self.log_status("Initializing backend...")
-                # Pass existing napari viewer to backend
                 self.viewer_backend = ThorlabsLiveViewerSimple(
-                    self.current_folder, 
-                    viewer=self.napari_viewer
+                    self.current_folder, viewer=self.napari_viewer
                 )
-            
-            # Start monitoring
-            chunk_size = self.chunk_size_spin.value()
-            wait_time = self.wait_time_spin.value()
+
+            chunk_size   = self.chunk_size_spin.value()
+            wait_time    = self.wait_time_spin.value()
             use_gaussian = self.gaussian_checkbox.isChecked()
-            
-            self.log_status(f"Started: Chunk={chunk_size}")
+
+            self.log_status(f"▶ Live: chunk={chunk_size}, wait={wait_time}s")
             self.viewer_backend.start_live_monitoring(chunk_size, wait_time, use_gaussian_filter=use_gaussian)
 
-            # Populate channel dropdown
             self._populate_channel_dropdown()
-
-            # Connect backend data signal to ROI update logic
             self.viewer_backend.updater.data_ready.connect(self.on_data_ready)
-
-            # Connect to Napari shapes layer
             self.connect_to_napari_shapes()
 
-            # Update UI
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
             self.restart_button.setEnabled(True)
             self.progress_bar.setVisible(True)
             self.progress_bar.setMaximum(self.viewer_backend.nFrames)
             self.progress_label.setText("Monitoring...")
-            
+            self._set_mode_controls_enabled(False)
+
         except Exception as e:
             self.log_status(f"❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Failed to start:\n{e}")
-    
+
+    def _start_offline(self):
+        """Load a finished acquisition — all frames at once, no live-edge waiting."""
+        try:
+            if self.viewer_backend is None:
+                self.log_status("Initializing backend…")
+                self.viewer_backend = ThorlabsLiveViewerSimple(
+                    self.current_folder, viewer=self.napari_viewer
+                )
+
+            chunk_size   = self.chunk_size_spin.value()
+            use_gaussian = self.gaussian_checkbox.isChecked()
+
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.restart_button.setEnabled(False)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setMaximum(self.viewer_backend.nFrames)
+            self.progress_label.setText("Loading…")
+            self.log_status(f"📂 Loading all {self.viewer_backend.nFrames} frames…")
+            self._set_mode_controls_enabled(False)
+
+            self._populate_channel_dropdown()
+            self.viewer_backend.updater.data_ready.connect(self.on_data_ready)
+            self.connect_to_napari_shapes()
+
+            def _progress(current, total):
+                self.status_updater.progress_update.emit(current, total)
+
+            self.viewer_backend.load_all_frames(
+                chunk_size=chunk_size,
+                use_gaussian_filter=use_gaussian,
+                progress_callback=_progress,
+            )
+
+            def _check_done():
+                if not self.viewer_backend.monitoring_active:
+                    self._done_timer.stop()
+                    self.stop_button.setEnabled(False)
+                    self.start_button.setEnabled(True)
+                    self.progress_bar.setVisible(False)
+                    n = self.viewer_backend.currentLastFrame
+                    self.progress_label.setText(f"{n} frames loaded")
+                    self.log_status(f"✅ Loaded {n} frames")
+                    self._set_mode_controls_enabled(True)
+
+            self._done_timer = QTimer()
+            self._done_timer.timeout.connect(_check_done)
+            self._done_timer.start(500)
+
+        except Exception as e:
+            self.log_status(f"❌ Error: {e}")
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed to load:\n{e}")
+
+    def open_static(self):
+        """Kept for compatibility — delegates to _start_offline."""
+        self._start_offline()
+
     def stop_monitoring(self):
         """Stop live monitoring"""
         if self.viewer_backend:
             self.log_status("Stopping...")
             self.viewer_backend.stop_monitoring()
-            
-            # Update UI
+
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.restart_button.setEnabled(False)
             self.progress_bar.setVisible(False)
             self.progress_label.setText("Stopped")
-            
+            self._set_mode_controls_enabled(True)
             self.log_status("Stopped")
     
     def restart_monitoring(self):

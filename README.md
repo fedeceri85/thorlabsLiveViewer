@@ -89,4 +89,4 @@ The application expects folders to contain:
 ## Author
 
 Federico Ceriani  
-Last Updated: February 2026
+Last Updated: May 2026

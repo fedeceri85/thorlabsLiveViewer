@@ -417,6 +417,88 @@ class ThorlabsLiveViewerSimple:
                 
         print("🔄 Data arrays reset for new monitoring session")
     
+    def load_all_frames(self, chunk_size=500, use_gaussian_filter=True, progress_callback=None):
+        """Load a finished (fully written) file without live-edge waiting.
+
+        Args:
+            chunk_size:          Logical frames per loading chunk.
+            use_gaussian_filter: Apply Gaussian smoothing.
+            progress_callback:   Optional callable(current, total) for progress updates.
+        """
+        if self.monitoring_active:
+            print("⚠️  Already monitoring — stop first")
+            return
+
+        # Refresh nFrames from current file size
+        nbytes = getsize(self.fullpath)
+        self.nFrames = int(nbytes / (self.frameSize * self.num_channels))
+
+        self.reset_data_arrays()
+        self.monitoring_active = True
+        self.stop_flag.clear()
+        self.use_gaussian_filter = use_gaussian_filter
+
+        ch_names = self.channel_names
+        num_ch   = self.num_channels
+
+        print(f"📂 Loading finished file: {self.nFrames} logical frames")
+
+        def _load_thread():
+            current_frame = 0
+            total = self.nFrames
+
+            while not self.stop_flag.is_set() and current_frame < total:
+                end_frame = min(current_frame + chunk_size, total)
+                new_block = self.loadFrameChunk(current_frame, end_frame)
+
+                if new_block is None:
+                    break
+
+                # Trim trailing all-zero frames (pre-allocated but not yet written)
+                last_valid = new_block.shape[0]
+                for i in range(new_block.shape[0] - 1, -1, -1):
+                    if not np.all(new_block[i] == 0):
+                        break
+                    last_valid = i
+                new_block = new_block[:last_valid]
+                if new_block.shape[0] == 0:
+                    print("🏁 Reached end of written data (trailing zeros)")
+                    break
+
+                # Deinterleave channels
+                channel_blocks = {ch: new_block[idx::num_ch] for idx, ch in enumerate(ch_names)}
+                logical_loaded = channel_blocks[ch_names[0]].shape[0]
+
+                if logical_loaded > 0:
+                    with self.data_lock:
+                        for ch_name in ch_names:
+                            ch_block = channel_blocks[ch_name]
+                            if self.use_gaussian_filter:
+                                if sys.platform != 'darwin' and HAS_CUPY:
+                                    ch_block_gpu = cp.asarray(ch_block, dtype=np.uint16)
+                                    ch_block = cp.asnumpy(gaussian_filter(ch_block_gpu, (2, 2, 2)))
+                                    del ch_block_gpu
+                                    cp.get_default_memory_pool().free_all_blocks()
+                                else:
+                                    ch_block = gaussian_filter(ch_block, (2, 2, 2))
+                            self.arrays[ch_name] = np.vstack([self.arrays[ch_name], ch_block])
+
+                        current_frame += logical_loaded
+                        self.currentLastFrame = self.arrays[ch_names[0]].shape[0]
+                        data_copy = {ch: arr.copy() for ch, arr in self.arrays.items()}
+
+                    if progress_callback:
+                        progress_callback(self.currentLastFrame, total)
+
+                    self.updater.data_ready.emit(data_copy)
+                    print(f"📈 {self.currentLastFrame}/{total} frames loaded")
+
+            self.monitoring_active = False
+            print(f"✅ Finished loading {self.currentLastFrame} frames")
+
+        self.monitor_thread = threading.Thread(target=_load_thread, daemon=True)
+        self.monitor_thread.start()
+
     def stop_monitoring(self):
         """Stop the live monitoring"""
         if self.monitoring_active:
