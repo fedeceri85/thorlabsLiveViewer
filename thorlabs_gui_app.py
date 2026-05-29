@@ -428,7 +428,12 @@ class ThorlabsGUI(QMainWindow):
         self.detach_plot_button = QPushButton("⧉ Detach Plot")
         self.detach_plot_button.setToolTip("Pop the ROI plot into a separate floating window")
         self.detach_plot_button.clicked.connect(self.toggle_detach_roi_plot)
-        roi_layout.addWidget(self.detach_plot_button, 4, 0, 1, 2)
+        roi_layout.addWidget(self.detach_plot_button, 4, 0)
+
+        self.force_roi_button = QPushButton("🔄 Update ROIs")
+        self.force_roi_button.setToolTip("Immediately recompute ROI traces from current data")
+        self.force_roi_button.clicked.connect(self.force_roi_update)
+        roi_layout.addWidget(self.force_roi_button, 4, 1)
 
         # Info label
         roi_info = QLabel("Draw shapes in Napari to create ROIs")
@@ -1007,6 +1012,21 @@ class ThorlabsGUI(QMainWindow):
              if selected_ch in self.viewer_backend.arrays:
                  self.update_roi_plot(self.viewer_backend.arrays[selected_ch])
              self.log_status("Updated ROI Data")
+
+    def force_roi_update(self):
+        """Force a full ROI recalculation from all currently loaded frames."""
+        if not self.viewer_backend or not hasattr(self.viewer_backend, 'arrays'):
+            self.log_status("⚠️  No data loaded yet")
+            return
+        selected_ch = self.roi_channel_combo.currentText()
+        if selected_ch not in self.viewer_backend.arrays:
+            return
+        # Mark dirty so update_roi_plot reprocesses everything from frame 0
+        self.roi_dirty = True
+        self.last_roi_frame_index = 0
+        self.roi_data = {}
+        self.update_roi_plot(self.viewer_backend.arrays[selected_ch])
+        self.log_status("🔄 ROI plot updated")
 
     def average_last_n_frames(self):
         """Average the last N frames from the livestream and display in Napari"""
