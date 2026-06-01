@@ -72,11 +72,12 @@ class ThorlabsGUI(QMainWindow):
         self.roi_enabled = True
         self.roi_data = {}  # Dictionary to store data for multiple ROIs
         self.napari_shapes_layer = None
+        self.napari_labels_layer = None  # Labels layer "Masks" takes precedence over shapes
         self.roi_dirty = False # Flag to trigger full recalculation
         self.last_roi_frame_index = 0 # Track last processed frame
         
         # ROI color management
-        self.roi_colors = ['#00ff00', '#ff0000', '#0000ff', '#ffff00', '#ff00ff', '#00ffff', 
+        self.roi_colors = ['#00ff00', '#ff0000', "#d7d7ff", '#ffff00', '#ff00ff', '#00ffff', 
                           '#ffa500', '#ff69b4', '#32cd32', '#ba55d3', '#20b2aa', '#dda0dd']
         self.color_index = 0  # Track next color to assign
         self.roi_color_map = {}  # Map ROI names to colors
@@ -436,7 +437,7 @@ class ThorlabsGUI(QMainWindow):
         roi_layout.addWidget(self.force_roi_button, 4, 1)
 
         # Info label
-        roi_info = QLabel("Draw shapes in Napari to create ROIs")
+        roi_info = QLabel("Draw shapes in 'Annotations' layer, or add a Labels layer named 'Masks' (labels take precedence)")
         roi_info.setStyleSheet("color: #aaaaaa; font-style: italic; font-size: 10px")
         roi_info.setWordWrap(True)
         roi_layout.addWidget(roi_info, 5, 0, 1, 2)
@@ -674,6 +675,7 @@ class ThorlabsGUI(QMainWindow):
             self.viewer_backend.close()
             self.viewer_backend = None
             self.napari_shapes_layer = None
+            self.napari_labels_layer = None
         
         # Validate folder: need raw file + either Experiment.xml or any Chan*_Preview.tif
         raw_file = os.path.join(folder, "Image_001_001.raw")
@@ -821,6 +823,7 @@ class ThorlabsGUI(QMainWindow):
         if self.viewer_backend:
             self.log_status("Restarting...")
             self.napari_shapes_layer = None
+            self.napari_labels_layer = None
             
             chunk_size = self.chunk_size_spin.value()
             wait_time = self.wait_time_spin.value()
@@ -938,7 +941,10 @@ class ThorlabsGUI(QMainWindow):
             if not raw:
                 continue
             if roi_name not in self.roi_color_map:
-                continue
+                # Auto-assign a color for label-based (or any new) ROIs
+                color = self.roi_colors[self.color_index % len(self.roi_colors)]
+                self.roi_color_map[roi_name] = color
+                self.color_index += 1
             color = self.roi_color_map[roi_name]
             if use_dfof:
                 arr = np.array(raw, dtype=float)
@@ -952,29 +958,47 @@ class ThorlabsGUI(QMainWindow):
             self.roi_plot_widget.plot(y, pen=pg.mkPen(color, width=2), name=roi_name)
     
     def connect_to_napari_shapes(self):
-        """Connect to Napari's shapes layer for ROI monitoring"""
-        # (Simplified logic - re-uses existing robust connection logic ideally)
+        """Connect to Napari's shapes/labels layers for ROI monitoring.
+
+        A Labels layer named 'Masks' takes precedence over the 'Annotations'
+        shapes layer when both are present.
+        """
         if not self.viewer_backend: return
-        
-        # Try to find 'Annotations' layer
-        found = False
+
+        # --- Labels layer "Masks" (higher priority) ---
+        labels_found = False
+        for layer in self.napari_viewer.layers:
+            if layer.name == 'Masks' and isinstance(layer, napari.layers.Labels):
+                if self.napari_labels_layer is not layer:
+                    self.napari_labels_layer = layer
+                    try:
+                        layer.events.data.connect(self.on_labels_changed)
+                    except Exception:
+                        pass
+                    self.log_status("Linked to 'Masks' labels layer")
+                    self.roi_dirty = True
+                    self.last_roi_frame_index = 0
+                labels_found = True
+                break
+        if not labels_found:
+            self.napari_labels_layer = None
+
+        # --- Shapes layer 'Annotations' (fallback) ---
+        shapes_found = False
         for layer in self.napari_viewer.layers:
             if layer.name == 'Annotations':
-                self.napari_shapes_layer = layer
-                # Connect events
-                layer.events.data.connect(self.on_shapes_changed)
-                layer.events.highlight.connect(self.on_shapes_changed) # sometimes needed
-                found = True
-                self.log_status("Linked to ROI layer")
-                
-                # Reset tracking
-                self.roi_dirty = True
-                self.last_roi_frame_index = 0
+                if self.napari_shapes_layer is not layer:
+                    self.napari_shapes_layer = layer
+                    layer.events.data.connect(self.on_shapes_changed)
+                    layer.events.highlight.connect(self.on_shapes_changed)
+                    self.log_status("Linked to 'Annotations' shapes layer")
+                    if not labels_found:
+                        self.roi_dirty = True
+                        self.last_roi_frame_index = 0
+                shapes_found = True
                 break
-        
-        if not found and len(self.napari_viewer.layers) > 0:
-            # Fallback
-            pass
+        if not shapes_found:
+            self.napari_shapes_layer = None
             
     def on_shapes_changed(self, event):
         """Called when shapes are modified in Napari"""
@@ -982,6 +1006,11 @@ class ThorlabsGUI(QMainWindow):
             # Mark as dirty to trigger full recalculation on next update
             self.roi_dirty = True
             self.update_shape_colors()
+
+    def on_labels_changed(self, event):
+        """Called when the 'Masks' labels layer is modified in Napari"""
+        if self.roi_enabled:
+            self.roi_dirty = True
     
     def update_shape_colors(self):
         """Update Napari shape colors"""
@@ -1079,108 +1108,102 @@ class ThorlabsGUI(QMainWindow):
                 self.update_roi_plot(data[selected_ch])
 
     def update_roi_plot(self, image_data):
-        """Update ROI plot with new data"""
+        """Update ROI plot with new data.
+
+        If a Labels layer named 'Masks' is present it takes precedence over
+        the 'Annotations' shapes layer.  ROIs are derived from the pixel masks
+        of each unique non-zero label value.
+        """
         if not self.roi_enabled or image_data is None or image_data.size == 0:
             return
-            
-        if self.napari_shapes_layer is None:
-            self.connect_to_napari_shapes()
-            # If still None, try to get it from viewer again (maybe user created it)
-            if self.napari_shapes_layer is None:
-                 for layer in self.napari_viewer.layers:
-                    if layer.name == 'Annotations':
-                        self.napari_shapes_layer = layer
-                        layer.events.data.connect(self.on_shapes_changed)
-                        self.roi_dirty = True
-                        break
-            if self.napari_shapes_layer is None: return
+
+        # Refresh layer references in case the user added them after starting
+        self.connect_to_napari_shapes()
+
+        # Decide which source to use: labels > shapes
+        use_labels = self.napari_labels_layer is not None
+        use_shapes = (not use_labels) and (self.napari_shapes_layer is not None)
+
+        if not use_labels and not use_shapes:
+            return
 
         try:
             # Handle Dirty State (ROI Changed)
             if self.roi_dirty:
                 self.roi_data = {}
                 self.last_roi_frame_index = 0
-                # We will process from 0 to end
                 self.roi_dirty = False
-                
+
             total_frames = len(image_data)
             start_frame = self.last_roi_frame_index
-            
-            # If we are somehow ahead (shouldn't happen unless reset), reset
+
             if start_frame > total_frames:
                 start_frame = 0
                 self.roi_data = {}
-            
-            # Nothing new to process
+
             if start_frame == total_frames:
                 return
 
-            # Get shapes once
-            shapes_data = self.napari_shapes_layer.data
-            if len(shapes_data) == 0:
-                self.last_roi_frame_index = total_frames
-                self.roi_plot_widget.clear()
-                return
-
-            # Prepare data structure
-            for i in range(len(shapes_data)):
-                roi_name = f"ROI_{i}"
-                if roi_name not in self.roi_data:
-                    self.roi_data[roi_name] = []
-
-            # Optimization: Pre-compute masks for simple shapes if possible
-            # For now, just iterate. Speed should be fine for typical ROI counts.
-            
-            # We need to process image_data[start_frame : total_frames]
-            # If image_data is (N, H, W)
-            
             new_chunk = image_data[start_frame:total_frames]
-            
-            # Iterate over shapes
-            from skimage.draw import polygon
-            
-            # Cache masks for this update
-            masks = []
-            valid_shapes = []
-            
-            for i, shape in enumerate(shapes_data):
-                 if len(shape) >= 3:
-                     # Create mask
-                     # Note: shape coordinates are (row, col)
-                     # We assume image dimensions match the last frame
-                     # This might fail if image size changes, but that shouldn't happen live
-                     H, W = image_data[0].shape
-                     r, c = polygon(shape[:, 0], shape[:, 1], (H, W))
-                     
-                     if len(r) > 0:
-                         masks.append((r, c))
-                         valid_shapes.append(i)
-            
+            H, W = image_data[0].shape
+
+            # ------------------------------------------------------------------
+            # Build masks list depending on source
+            # ------------------------------------------------------------------
+            masks = []        # list of boolean/index masks
+            roi_names = []    # corresponding ROI names
+
+            if use_labels:
+                labels_data = self.napari_labels_layer.data
+                # labels_data may be 2-D (H, W) or 3-D (Z, H, W); use last 2 dims
+                if labels_data.ndim > 2:
+                    labels_data = labels_data[0]
+                unique_labels = np.unique(labels_data)
+                unique_labels = unique_labels[unique_labels != 0]  # exclude background
+                if len(unique_labels) == 0:
+                    self.last_roi_frame_index = total_frames
+                    self.roi_plot_widget.clear()
+                    return
+                for lv in unique_labels:
+                    mask = labels_data == lv
+                    masks.append(mask)
+                    roi_names.append(f"Label_{lv}")
+
+            else:  # use shapes
+                shapes_data = self.napari_shapes_layer.data
+                if len(shapes_data) == 0:
+                    self.last_roi_frame_index = total_frames
+                    self.roi_plot_widget.clear()
+                    return
+                from skimage.draw import polygon
+                for i, shape in enumerate(shapes_data):
+                    if len(shape) >= 3:
+                        r, c = polygon(shape[:, 0], shape[:, 1], (H, W))
+                        if len(r) > 0:
+                            mask = np.zeros((H, W), dtype=bool)
+                            mask[r, c] = True
+                            masks.append(mask)
+                            roi_names.append(f"ROI_{i}")
+
             if not masks:
                 self.last_roi_frame_index = total_frames
                 return
-                
-            # Compute means for the chunk
-            # Vectorized approach: 
-            # We want mean intensity for each ROI for each frame in new_chunk.
-            
-            # Loop over frames in chunk
-            for frame_idx in range(len(new_chunk)):
-                frame = new_chunk[frame_idx]
-                
-                for k, (r, c) in enumerate(masks):
-                    shape_idx = valid_shapes[k]
-                    roi_name = f"ROI_{shape_idx}"
-                    
-                    mean_val = np.mean(frame[r, c])
-                    self.roi_data[roi_name].append(mean_val)
-            
-            # Update index
+
+            # Initialise data buffers for new ROI names
+            for name in roi_names:
+                if name not in self.roi_data:
+                    self.roi_data[name] = []
+
+            # ------------------------------------------------------------------
+            # Compute mean intensity per ROI per frame
+            # ------------------------------------------------------------------
+            for frame in new_chunk:
+                for mask, name in zip(masks, roi_names):
+                    self.roi_data[name].append(float(np.mean(frame[mask])))
+
             self.last_roi_frame_index = total_frames
-            
-            # Update plot
             self._replot_roi_data()
-                    
+
         except Exception as e:
             # print(f"ROI Update Error: {e}")
             pass
