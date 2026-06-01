@@ -47,6 +47,14 @@ except ImportError:
     print("Warning: Could not import Napari QtViewer")
     QtViewer = None
 
+# Optional cellpose import
+try:
+    from cellpose import models as cellpose_models
+    CELLPOSE_AVAILABLE = True
+except ImportError:
+    CELLPOSE_AVAILABLE = False
+    print("Info: cellpose not found – auto-segmentation disabled")
+
 # Import the live viewer
 from thorlabs_live_viewer_simple import ThorlabsLiveViewerSimple
 
@@ -56,6 +64,7 @@ class StatusUpdater(QObject):
     status_update = Signal(str)
     progress_update = Signal(int, int)  # current, total
     roi_update = Signal(np.ndarray)  # ROI data for plotting
+    cellpose_done = Signal(object)    # carries (masks, diams) tuple or Exception
 
 
 class ThorlabsGUI(QMainWindow):
@@ -87,6 +96,7 @@ class ThorlabsGUI(QMainWindow):
         self.status_updater.status_update.connect(self.update_status_display)
         self.status_updater.progress_update.connect(self.update_progress)
         self.status_updater.roi_update.connect(self.update_roi_plot)
+        self.status_updater.cellpose_done.connect(self._on_cellpose_done)
         
         # Apply dark theme
         self.apply_dark_theme()
@@ -471,6 +481,48 @@ class ThorlabsGUI(QMainWindow):
         snapshot_layout.addWidget(self.avg_button)
         
         left_layout.addWidget(snapshot_group)
+
+        # Cellpose auto-segmentation group
+        cellpose_group = QGroupBox("🔬 Cellpose Segmentation")
+        cellpose_layout = QGridLayout(cellpose_group)
+
+        # Diameter
+        cellpose_layout.addWidget(QLabel("Diameter (px):"), 0, 0)
+        self.cellpose_diameter_spin = QSpinBox()
+        self.cellpose_diameter_spin.setRange(1, 2000)
+        self.cellpose_diameter_spin.setValue(100)
+        self.cellpose_diameter_spin.setToolTip("Approximate cell diameter in pixels (0 = auto)")
+        cellpose_layout.addWidget(self.cellpose_diameter_spin, 0, 1)
+
+        # Flow threshold (probability)
+        cellpose_layout.addWidget(QLabel("Flow threshold:"), 1, 0)
+        self.cellpose_prob_spin = QDoubleSpinBox()
+        self.cellpose_prob_spin.setRange(-6.0, 6.0)
+        self.cellpose_prob_spin.setSingleStep(0.1)
+        self.cellpose_prob_spin.setDecimals(2)
+        self.cellpose_prob_spin.setValue(0.0)
+        self.cellpose_prob_spin.setToolTip("Cellpose flow_threshold (lower = more cells detected)")
+        cellpose_layout.addWidget(self.cellpose_prob_spin, 1, 1)
+
+        # Run button
+        self.cellpose_run_button = QPushButton("▶ Run Cellpose (cyto2)")
+        self.cellpose_run_button.setToolTip(
+            "Average the last 100 frames of the selected ROI channel and run "
+            "Cellpose cyto2 segmentation. Result is added as a 'Masks' labels layer."
+        )
+        self.cellpose_run_button.clicked.connect(self.run_cellpose_segmentation)
+        cellpose_layout.addWidget(self.cellpose_run_button, 2, 0, 1, 2)
+
+        if not CELLPOSE_AVAILABLE:
+            self.cellpose_run_button.setEnabled(False)
+            self.cellpose_diameter_spin.setEnabled(False)
+            self.cellpose_prob_spin.setEnabled(False)
+            cellpose_group.setToolTip("cellpose package not installed – pip install cellpose")
+            unavail_label = QLabel("cellpose not installed")
+            unavail_label.setStyleSheet("color: #ff6666; font-style: italic; font-size: 10px")
+            cellpose_layout.addWidget(unavail_label, 3, 0, 1, 2)
+
+        left_layout.addWidget(cellpose_group)
         
         # Control buttons
         control_group = QGroupBox("🎮 Controls")
@@ -771,6 +823,11 @@ class ThorlabsGUI(QMainWindow):
             self.viewer_backend.updater.data_ready.connect(self.on_data_ready)
             self.connect_to_napari_shapes()
 
+            # Suppress auto ROI updates while loading — user presses "Update ROIs" when ready
+            self._pre_offline_auto_roi = self.auto_roi_checkbox.isChecked()
+            self.auto_roi_checkbox.setChecked(False)
+            self.auto_roi_checkbox.setEnabled(False)
+
             def _progress(current, total):
                 self.status_updater.progress_update.emit(current, total)
 
@@ -788,8 +845,11 @@ class ThorlabsGUI(QMainWindow):
                     self.progress_bar.setVisible(False)
                     n = self.viewer_backend.currentLastFrame
                     self.progress_label.setText(f"{n} frames loaded")
-                    self.log_status(f"✅ Loaded {n} frames")
+                    self.log_status(f"✅ Loaded {n} frames — press 'Update ROIs' to compute traces")
                     self._set_mode_controls_enabled(True)
+                    # Restore auto-ROI checkbox to its pre-load state
+                    self.auto_roi_checkbox.setEnabled(True)
+                    self.auto_roi_checkbox.setChecked(self._pre_offline_auto_roi)
 
             self._done_timer = QTimer()
             self._done_timer.timeout.connect(_check_done)
@@ -1094,6 +1154,165 @@ class ThorlabsGUI(QMainWindow):
         total_frames = self.viewer_backend.arrays[self.viewer_backend.channel_names[0]].shape[0]
         n_actual = min(n, total_frames)
         self.log_status(f"📸 Averaged last {n_actual} frames (of {total_frames} total)")
+
+    def run_cellpose_segmentation(self):
+        """Run Cellpose cyto2 segmentation on the average of the last 100 frames.
+
+        The result is added (or updated) as a 'Masks' Labels layer in the Napari
+        viewer, which then takes precedence over the 'Annotations' shapes layer
+        for ROI computation.
+        """
+        if not CELLPOSE_AVAILABLE:
+            self.log_status("❌ cellpose is not installed (pip install cellpose)")
+            return
+
+        if not self.viewer_backend or not hasattr(self.viewer_backend, 'arrays'):
+            self.log_status("⚠️  No data loaded yet")
+            return
+
+        selected_ch = self.roi_channel_combo.currentText()
+        if selected_ch not in self.viewer_backend.arrays:
+            self.log_status(f"⚠️  Channel '{selected_ch}' not available")
+            return
+
+        data = self.viewer_backend.arrays[selected_ch]
+        if data.size == 0:
+            self.log_status("⚠️  No frames in selected channel")
+            return
+
+        # Build input image: average of the last 100 frames
+        n_avg = min(100, data.shape[0])
+        img = np.mean(data[-n_avg:], axis=0).astype(np.float32)
+
+        diameter = float(self.cellpose_diameter_spin.value())
+        flow_threshold = float(self.cellpose_prob_spin.value())
+
+        self.log_status(f"🔬 Running Cellpose (cyto2) on avg of last {n_avg} frames…")
+        self.cellpose_run_button.setEnabled(False)
+
+        # Run in a background thread to avoid freezing the UI
+        def _thread_target():
+            try:
+                from skimage.transform import resize as sk_resize
+
+                # Normalise to uint8 so cellpose auto-scaling is predictable
+                img_norm = img.copy()
+                img_min, img_max = img_norm.min(), img_norm.max()
+                if img_max > img_min:
+                    img_norm = ((img_norm - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+                else:
+                    img_norm = img_norm.astype(np.uint8)
+
+                # Downsample large images — cellpose 4 SAM model is very slow on CPU
+                MAX_DIM = 512
+                orig_h, orig_w = img_norm.shape
+                scale = min(MAX_DIM / orig_h, MAX_DIM / orig_w, 1.0)
+                if scale < 1.0:
+                    new_h = max(1, int(round(orig_h * scale)))
+                    new_w = max(1, int(round(orig_w * scale)))
+                    img_norm = sk_resize(img_norm, (new_h, new_w),
+                                        order=1, preserve_range=True,
+                                        anti_aliasing=True).astype(np.uint8)
+                    diameter_scaled = diameter * scale if diameter > 0 else None
+                    print(f"[Cellpose] resized {orig_h}×{orig_w} → {new_h}×{new_w}, diam scaled {diameter:.0f}→{diameter_scaled:.0f}" if diameter > 0 else f"[Cellpose] resized {orig_h}×{orig_w} → {new_h}×{new_w}")
+                else:
+                    diameter_scaled = diameter if diameter > 0 else None
+                    scale = 1.0
+
+                # cellpose 4.x: use model_type kwarg for named models like cyto2
+                model = cellpose_models.CellposeModel(model_type='cyto2', gpu=True)
+                print("[Cellpose] model loaded, running eval…")
+                masks_small, flows, styles = model.eval(
+                    img_norm,
+                    diameter=diameter_scaled,
+                    flow_threshold=flow_threshold,
+                )
+                masks_small = np.array(masks_small)
+
+                # Upsample masks back to original resolution
+                if scale < 1.0:
+                    from skimage.transform import resize as sk_resize2
+                    masks_full = sk_resize2(masks_small.astype(np.float32),
+                                           (orig_h, orig_w),
+                                           order=0, preserve_range=True,
+                                           anti_aliasing=False).astype(np.int32)
+                else:
+                    masks_full = masks_small.astype(np.int32)
+
+                diams = getattr(model, 'diam_mean', diameter)
+                print(f"[Cellpose] done — unique labels: {len(np.unique(masks_full)) - 1}")
+                self.status_updater.cellpose_done.emit((masks_full, diams))
+            except Exception as exc:
+                import traceback; traceback.print_exc()
+                self.status_updater.cellpose_done.emit(exc)
+
+        threading.Thread(target=_thread_target, daemon=True).start()
+
+    def _on_cellpose_done(self, result):
+        """Called on the Qt main thread when Cellpose finishes."""
+        self.cellpose_run_button.setEnabled(True)
+        if isinstance(result, Exception):
+            self.log_status(f"❌ Cellpose error: {result}")
+            import traceback; traceback.print_exc()
+            return
+
+        masks, diams = result
+
+        # Ensure masks is a 2-D int32 ndarray (cellpose can return a list for batch input)
+        if not isinstance(masks, np.ndarray):
+            masks = np.array(masks)
+        if masks.ndim > 2:
+            masks = masks[0]
+        masks = masks.astype(np.int32)
+
+        # diams may be a scalar, list, or ndarray depending on cellpose version
+        try:
+            diam_val = float(np.mean(diams)) if hasattr(diams, '__len__') else float(diams)
+        except Exception:
+            diam_val = 0.0
+        n_cells = int(masks.max())
+        self.log_status(f"✅ Cellpose found {n_cells} cell(s) — mask shape {masks.shape}, dtype {masks.dtype} (est. diam {diam_val:.1f} px)")
+
+        if n_cells == 0:
+            self.log_status("⚠️  No cells found — try lowering the flow threshold or adjusting the diameter")
+
+        # Add or update the 'Masks' labels layer
+        try:
+            existing = None
+            for layer in self.napari_viewer.layers:
+                if layer.name == 'Masks' and isinstance(layer, napari.layers.Labels):
+                    existing = layer
+                    break
+            if existing is not None:
+                existing.data = masks
+                self.log_status("🗂️  'Masks' labels layer updated")
+            else:
+                new_layer = self.napari_viewer.add_labels(masks, name='Masks')
+                self.log_status(f"🗂️  'Masks' labels layer added ({new_layer})")
+            # Ensure layer is visible
+            for layer in self.napari_viewer.layers:
+                if layer.name == 'Masks':
+                    layer.visible = True
+                    break
+        except Exception as exc:
+            self.log_status(f"❌ Failed to add Masks layer: {exc}")
+            import traceback; traceback.print_exc()
+            return
+
+        # Wire up the new layer for ROI tracking — bypass viewer_backend guard
+        self.napari_labels_layer = None
+        for layer in self.napari_viewer.layers:
+            if layer.name == 'Masks' and isinstance(layer, napari.layers.Labels):
+                self.napari_labels_layer = layer
+                try:
+                    layer.events.data.connect(self.on_labels_changed)
+                except Exception:
+                    pass
+                break
+
+        self.roi_dirty = True
+        self.last_roi_frame_index = 0
+        self.roi_data = {}
 
     def on_data_ready(self, data):
         """Called when backend has new data ready.
