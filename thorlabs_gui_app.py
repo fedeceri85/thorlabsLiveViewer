@@ -17,8 +17,8 @@ Features:
 Usage:
     python thorlabs_gui_app.py
 
-Author: AI Assistant
-Date: August 2025
+Author: Federico Ceriani    
+Date: June 2026
 """
 
 import os
@@ -632,11 +632,28 @@ class ThorlabsGUI(QMainWindow):
         self.roi_plot_widget.setLabel('bottom', 'Frame Number')
         self.roi_plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.roi_plot_widget.addLegend()
+        
+        # Performance optimizations for large numbers of ROIs and frames
+        self.roi_plot_widget.setClipToView(True)
+        self.roi_plot_widget.setDownsampling(mode='peak', auto=True)
         self.roi_curves = {}
         self.plot_detached = False  # Track detached state
         self._detached_plot_window = None  # Floating window reference
         
+        # Current Frame Indicator (Vertical Line)
+        self.roi_v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('y', width=1.5, style=Qt.DashLine))
+        self.roi_plot_widget.addItem(self.roi_v_line)
+        self.roi_v_line.setVisible(False)
+        
+        # Debouncer for vertical line updates
+        self.v_line_timer = QTimer()
+        self.v_line_timer.setSingleShot(True)
+        self.v_line_timer.timeout.connect(self._update_v_line_position)
+        
         self.right_splitter.addWidget(self.roi_plot_widget)
+        
+        # Connect Napari scroll to ROI line
+        self.napari_viewer.dims.events.current_step.connect(self._on_napari_scroll)
         
         # Set initial sizes (2/3 Napari, 1/3 Plot)
         # We need to set this after the widget is shown or use a timer, 
@@ -649,6 +666,30 @@ class ThorlabsGUI(QMainWindow):
         main_layout.addWidget(left_panel, 1)      # Stretch factor 1
         main_layout.addWidget(self.right_splitter, 3) # Stretch factor 3
         
+    def _on_napari_scroll(self, event):
+        """Debounce the scroll event so the plot isn't constantly repainted while dragging."""
+        self.v_line_timer.start(50)  # Update 50ms after they stop scrolling
+
+    def _update_v_line_position(self):
+        """Update the vertical line on the ROI plot to match the current Napari frame."""
+        # Ensure we have ROI data to plot over
+        if not hasattr(self, 'roi_data') or not self.roi_data:
+            if hasattr(self, 'roi_v_line') and self.roi_v_line.isVisible():
+                self.roi_v_line.setVisible(False)
+            return
+
+        # Napari current_step is a tuple, e.g. (frame, y, x). First element is usually frame index.
+        try:
+            current_frame = self.napari_viewer.dims.current_step[0]
+            if current_frame <= self.last_roi_frame_index:
+                self.roi_v_line.setValue(current_frame)
+                if not self.roi_v_line.isVisible():
+                    self.roi_v_line.setVisible(True)
+            else:
+                self.roi_v_line.setVisible(False)
+        except Exception:
+            pass
+
     def browse_root_folder(self):
         """Open folder selection dialog for root directory"""
         folder = QFileDialog.getExistingDirectory(
@@ -1171,6 +1212,9 @@ class ThorlabsGUI(QMainWindow):
             return
         use_dfof = self.dfof_checkbox.isChecked()
         self.roi_plot_widget.clear()
+        if hasattr(self, 'roi_v_line'):
+            self.roi_plot_widget.addItem(self.roi_v_line)
+            
         for roi_name, raw in self.roi_data.items():
             if not raw:
                 continue
@@ -1224,7 +1268,6 @@ class ThorlabsGUI(QMainWindow):
                 if self.napari_shapes_layer is not layer:
                     self.napari_shapes_layer = layer
                     layer.events.data.connect(self.on_shapes_changed)
-                    layer.events.highlight.connect(self.on_shapes_changed)
                     self.log_status("Linked to 'Annotations' shapes layer")
                     if not labels_found:
                         self.roi_dirty = True
@@ -1668,6 +1711,8 @@ class ThorlabsGUI(QMainWindow):
                 if len(unique_labels) == 0:
                     self.last_roi_frame_index = total_frames
                     self.roi_plot_widget.clear()
+                    if hasattr(self, 'roi_v_line'):
+                        self.roi_plot_widget.addItem(self.roi_v_line)
                     return
                 for lv in unique_labels:
                     mask = labels_data == lv
@@ -1679,6 +1724,8 @@ class ThorlabsGUI(QMainWindow):
                 if len(shapes_data) == 0:
                     self.last_roi_frame_index = total_frames
                     self.roi_plot_widget.clear()
+                    if hasattr(self, 'roi_v_line'):
+                        self.roi_plot_widget.addItem(self.roi_v_line)
                     return
                 from skimage.draw import polygon
                 for i, shape in enumerate(shapes_data):
@@ -1700,11 +1747,14 @@ class ThorlabsGUI(QMainWindow):
                     self.roi_data[name] = []
 
             # ------------------------------------------------------------------
-            # Compute mean intensity per ROI per frame
+            # Compute mean intensity per ROI per frame (Vectorized)
             # ------------------------------------------------------------------
-            for frame in new_chunk:
-                for mask, name in zip(masks, roi_names):
-                    self.roi_data[name].append(float(np.mean(frame[mask])))
+            for mask, name in zip(masks, roi_names):
+                # new_chunk is (T, H, W), mask is (H, W). 
+                # new_chunk[:, mask] extracts all ROI pixels across all frames -> (T, N_pixels)
+                # mean(axis=1) computes the mean per frame -> (T,)
+                mean_intensities = new_chunk[:, mask].mean(axis=1)
+                self.roi_data[name].extend(mean_intensities.tolist())
 
             self.last_roi_frame_index = total_frames
             self._replot_roi_data()
