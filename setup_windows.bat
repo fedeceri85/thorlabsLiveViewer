@@ -27,7 +27,7 @@ echo Activating environment and installing dependencies...
 echo This may take a few minutes. Please wait...
 call .venv\Scripts\activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 echo.
 echo ========================================

@@ -12,5 +12,5 @@ sampleImage/*
 venv/
 __pycache__/
 *.pyc
-requirements.txt
-GEMINI.md
+#requirements.txt
+#GEMINI.md
