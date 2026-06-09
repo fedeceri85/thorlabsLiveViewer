@@ -242,7 +242,7 @@ class ThorlabsLiveViewerSimple:
         
         return stack
     
-    def start_live_monitoring(self, chunk_size=500, wait_time=3.0, use_gaussian_filter=True):
+    def start_live_monitoring(self, chunk_size=500, wait_time=3.0, use_gaussian_filter=True, avg_every=1):
         """Start live monitoring with simple background thread"""
         if self.monitoring_active:
             print("⚠️  Monitoring already active")
@@ -254,13 +254,17 @@ class ThorlabsLiveViewerSimple:
         self.monitoring_active = True
         self.stop_flag.clear()
         self.use_gaussian_filter = use_gaussian_filter
+        self.avg_every = avg_every
+        self.frame_buffer = {ch: [] for ch in self.channel_names}
         
         filter_status = "🌟 enabled" if use_gaussian_filter else "🚫 disabled"
         print(f"🎬 Starting simple live monitoring:")
         print(f"   • Chunk size: {chunk_size} frames")
         print(f"   • Wait time: {wait_time}s at live edge")
         print(f"   • Gaussian filter: {filter_status}")
-        print(f"   • Total frames allocated: {self.nFrames}")
+        if self.avg_every > 1:
+            print(f"   • Averaging: every {self.avg_every} frames")
+        print(f"   • Total raw frames allocated: {self.nFrames}")
         
         def monitoring_thread():
             """Simple background monitoring thread"""
@@ -329,6 +333,23 @@ class ThorlabsLiveViewerSimple:
                         with self.data_lock:
                             for ch_name in ch_names:
                                 ch_block = channel_blocks[ch_name]
+                                
+                                if self.avg_every > 1:
+                                    if len(self.frame_buffer[ch_name]) > 0:
+                                        ch_block = np.vstack([self.frame_buffer[ch_name], ch_block])
+                                    rem = ch_block.shape[0] % self.avg_every
+                                    if rem > 0:
+                                        self.frame_buffer[ch_name] = ch_block[-rem:]
+                                        ch_block = ch_block[:-rem]
+                                    else:
+                                        self.frame_buffer[ch_name] = []
+                                    
+                                    if ch_block.shape[0] > 0:
+                                        n_avg = ch_block.shape[0] // self.avg_every
+                                        ch_block = ch_block.reshape(n_avg, self.avg_every, self.height, self.width).mean(axis=1).astype(np.uint16)
+                                    else:
+                                        continue
+
                                 if self.use_gaussian_filter:
                                     if sys.platform != 'darwin' and HAS_CUPY:
                                         # GPU processing path
@@ -350,7 +371,10 @@ class ThorlabsLiveViewerSimple:
                         # Signal GUI update (thread-safe Qt signal)
                         self.updater.data_ready.emit(data_copy)
                         
-                        print(f"📈 Loaded {logical_loaded} logical frames, total: {self.currentLastFrame}")
+                        if self.avg_every > 1:
+                            print(f"📈 Loaded {logical_loaded} raw frames (now {self.currentLastFrame} averaged frames total)")
+                        else:
+                            print(f"📈 Loaded {logical_loaded} logical frames, total: {self.currentLastFrame}")
                     
                     # Small pause to prevent overload
                     time.sleep(0.05)
@@ -417,13 +441,14 @@ class ThorlabsLiveViewerSimple:
                 
         print("🔄 Data arrays reset for new monitoring session")
     
-    def load_all_frames(self, chunk_size=500, use_gaussian_filter=True, progress_callback=None):
+    def load_all_frames(self, chunk_size=500, use_gaussian_filter=True, progress_callback=None, avg_every=1):
         """Load a finished (fully written) file without live-edge waiting.
 
         Args:
             chunk_size:          Logical frames per loading chunk.
             use_gaussian_filter: Apply Gaussian smoothing.
             progress_callback:   Optional callable(current, total) for progress updates.
+            avg_every:           Number of frames to average together.
         """
         if self.monitoring_active:
             print("⚠️  Already monitoring — stop first")
@@ -437,11 +462,16 @@ class ThorlabsLiveViewerSimple:
         self.monitoring_active = True
         self.stop_flag.clear()
         self.use_gaussian_filter = use_gaussian_filter
+        self.avg_every = avg_every
+        self.frame_buffer = {ch: [] for ch in self.channel_names}
 
         ch_names = self.channel_names
         num_ch   = self.num_channels
 
-        print(f"📂 Loading finished file: {self.nFrames} logical frames")
+        if self.avg_every > 1:
+            print(f"📂 Loading finished file: {self.nFrames} raw frames (will yield ~{self.nFrames // self.avg_every} averaged frames)")
+        else:
+            print(f"📂 Loading finished file: {self.nFrames} logical frames")
 
         def _load_thread():
             current_frame = 0
@@ -473,6 +503,23 @@ class ThorlabsLiveViewerSimple:
                     with self.data_lock:
                         for ch_name in ch_names:
                             ch_block = channel_blocks[ch_name]
+
+                            if self.avg_every > 1:
+                                if len(self.frame_buffer[ch_name]) > 0:
+                                    ch_block = np.vstack([self.frame_buffer[ch_name], ch_block])
+                                rem = ch_block.shape[0] % self.avg_every
+                                if rem > 0:
+                                    self.frame_buffer[ch_name] = ch_block[-rem:]
+                                    ch_block = ch_block[:-rem]
+                                else:
+                                    self.frame_buffer[ch_name] = []
+                                
+                                if ch_block.shape[0] > 0:
+                                    n_avg = ch_block.shape[0] // self.avg_every
+                                    ch_block = ch_block.reshape(n_avg, self.avg_every, self.height, self.width).mean(axis=1).astype(np.uint16)
+                                else:
+                                    continue
+
                             if self.use_gaussian_filter:
                                 if sys.platform != 'darwin' and HAS_CUPY:
                                     ch_block_gpu = cp.asarray(ch_block, dtype=np.uint16)
@@ -531,24 +578,25 @@ class ThorlabsLiveViewerSimple:
     def get_status(self):
         """Get current monitoring status"""
         status = "🟢 Active" if self.monitoring_active else "🔴 Inactive"
-        remaining = self.nFrames - self.currentLastFrame
+        total = self.nFrames // getattr(self, 'avg_every', 1)
+        remaining = max(0, total - self.currentLastFrame)
         
         print(f"📊 Status: {status}")
-        print(f"📈 Frames loaded: {self.currentLastFrame}/{self.nFrames}")
+        print(f"📈 Frames loaded: {self.currentLastFrame}/{total}")
         print(f"⏳ Remaining: {remaining} frames")
         
         return {
             'active': self.monitoring_active,
             'frames_loaded': self.currentLastFrame,
-            'total_frames': self.nFrames,
+            'total_frames': total,
             'remaining': remaining
         }
     
-    def restart_monitoring(self, chunk_size=500, wait_time=3.0, use_gaussian_filter=True):
-        """Restart monitoring with new parameters"""
+    def restart_monitoring(self, chunk_size=500, wait_time=3.0, use_gaussian_filter=True, avg_every=1):
+        """Restart monitoring with specific parameters"""
         self.stop_monitoring()
-        time.sleep(0.5)  # Brief pause
-        self.start_live_monitoring(chunk_size, wait_time, use_gaussian_filter)
+        time.sleep(0.5)  # Wait for thread to fully stop
+        self.start_live_monitoring(chunk_size, wait_time, use_gaussian_filter, avg_every)
     
     def run_interactive(self):
         """Run interactive mode with controls"""

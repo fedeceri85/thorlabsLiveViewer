@@ -57,6 +57,7 @@ except ImportError:
 
 # Import the live viewer
 from thorlabs_live_viewer_simple import ThorlabsLiveViewerSimple
+from disk_streamed_viewer import DiskStreamedViewer
 
 
 class StatusUpdater(QObject):
@@ -347,15 +348,19 @@ class ThorlabsGUI(QMainWindow):
         mode_layout.setContentsMargins(0, 0, 0, 0)
         self.live_mode_radio = QRadioButton("🔴 Live")
         self.offline_mode_radio = QRadioButton("📂 Offline")
+        self.disk_stream_radio = QRadioButton("💾 Disk Stream")
         self.live_mode_radio.setChecked(True)
         self.live_mode_radio.setToolTip("Monitor a running acquisition in real time")
         self.offline_mode_radio.setToolTip("Load a completed acquisition all at once")
+        self.disk_stream_radio.setToolTip("Browse a completed acquisition lazily from disk (low memory)")
         self._mode_group = QButtonGroup(self)
         self._mode_group.addButton(self.live_mode_radio)
         self._mode_group.addButton(self.offline_mode_radio)
+        self._mode_group.addButton(self.disk_stream_radio)
         self._mode_group.buttonToggled.connect(self._on_mode_changed)
         mode_layout.addWidget(self.live_mode_radio)
         mode_layout.addWidget(self.offline_mode_radio)
+        mode_layout.addWidget(self.disk_stream_radio)
         folder_layout.addWidget(mode_widget, 1, 1, 1, 2)
 
         # Row 3: Experiment Dropdown
@@ -396,7 +401,23 @@ class ThorlabsGUI(QMainWindow):
         # Gaussian filter toggle
         self.gaussian_checkbox = QCheckBox("🌟 Apply Gaussian Filter")
         self.gaussian_checkbox.setChecked(True)  # Default to enabled
+        self.gaussian_checkbox.toggled.connect(self._on_gaussian_toggled)
         params_layout.addWidget(self.gaussian_checkbox, 2, 0, 1, 2)
+
+        # Average Every N frames
+        self.avg_every_checkbox = QCheckBox("📊 Average Every")
+        self.avg_every_checkbox.setChecked(False)
+        self.avg_every_checkbox.setToolTip("Average groups of N consecutive frames (reduces noise, reduces total frames)")
+        self.avg_every_checkbox.toggled.connect(self._on_avg_every_toggled)
+        params_layout.addWidget(self.avg_every_checkbox, 3, 0)
+
+        self.avg_every_spin = QSpinBox()
+        self.avg_every_spin.setRange(1, 100)
+        self.avg_every_spin.setValue(1)
+        self.avg_every_spin.setSuffix(" frames")
+        self.avg_every_spin.setToolTip("Number of consecutive frames to average together")
+        self.avg_every_spin.setEnabled(False)
+        params_layout.addWidget(self.avg_every_spin, 3, 1)
         
         left_layout.addWidget(params_group)
         
@@ -744,23 +765,63 @@ class ThorlabsGUI(QMainWindow):
             self.start_button.setEnabled(False)
     
     def _on_mode_changed(self, button, checked):
-        """Grey out Wait Time when offline mode is selected."""
+        """Update UI controls when acquisition mode is changed."""
         if not checked:
             return
         live = self.live_mode_radio.isChecked()
+        disk_stream = self.disk_stream_radio.isChecked()
+
         self.wait_time_spin.setEnabled(live)
-        self.start_button.setText("🚀 Start" if live else "📂 Load All")
+        self.chunk_size_spin.setEnabled(not disk_stream)
+
+        # Gaussian filter not available in disk-stream mode
+        if disk_stream:
+            self._pre_disk_gaussian = self.gaussian_checkbox.isChecked()
+            self.gaussian_checkbox.setChecked(False)
+            self.gaussian_checkbox.setEnabled(False)
+            # Average Every stays available in disk-stream mode
+            self.avg_every_checkbox.setEnabled(True)
+        else:
+            self.gaussian_checkbox.setEnabled(True)
+            if hasattr(self, '_pre_disk_gaussian'):
+                self.gaussian_checkbox.setChecked(self._pre_disk_gaussian)
+
+        if live:
+            self.start_button.setText("🚀 Start")
+        elif disk_stream:
+            self.start_button.setText("💾 Open")
+        else:
+            self.start_button.setText("📂 Load All")
+
+    def _on_gaussian_toggled(self, checked):
+        """Uncheck Average Every when Gaussian is enabled (mutually exclusive)."""
+        if checked:
+            self.avg_every_checkbox.blockSignals(True)
+            self.avg_every_checkbox.setChecked(False)
+            self.avg_every_spin.setEnabled(False)
+            self.avg_every_checkbox.blockSignals(False)
+
+    def _on_avg_every_toggled(self, checked):
+        """Uncheck Gaussian when Average Every is enabled (mutually exclusive)."""
+        self.avg_every_spin.setEnabled(checked)
+        if checked:
+            self.gaussian_checkbox.blockSignals(True)
+            self.gaussian_checkbox.setChecked(False)
+            self.gaussian_checkbox.blockSignals(False)
 
     def _set_mode_controls_enabled(self, enabled):
-        """Enable or disable the Live/Offline toggle (lock it while monitoring)."""
+        """Enable or disable the mode toggles (lock while monitoring)."""
         self.live_mode_radio.setEnabled(enabled)
         self.offline_mode_radio.setEnabled(enabled)
+        self.disk_stream_radio.setEnabled(enabled)
 
     def start_monitoring(self):
         """Start live monitoring or load a finished file, depending on mode."""
         if not self.current_folder:
             return
-        if self.offline_mode_radio.isChecked():
+        if self.disk_stream_radio.isChecked():
+            self._start_disk_stream()
+        elif self.offline_mode_radio.isChecked():
             self._start_offline()
         else:
             self._start_live()
@@ -768,6 +829,15 @@ class ThorlabsGUI(QMainWindow):
     def _start_live(self):
         """Start live monitoring."""
         try:
+            # Reset if wrong backend type
+            if self.viewer_backend is not None and not isinstance(self.viewer_backend, ThorlabsLiveViewerSimple):
+                self.stop_monitoring()
+                if hasattr(self.viewer_backend, 'close'):
+                    self.viewer_backend.close()
+                self.viewer_backend = None
+                self.napari_shapes_layer = None
+                self.napari_labels_layer = None
+
             if self.viewer_backend is None:
                 self.log_status("Initializing backend...")
                 self.viewer_backend = ThorlabsLiveViewerSimple(
@@ -777,9 +847,12 @@ class ThorlabsGUI(QMainWindow):
             chunk_size   = self.chunk_size_spin.value()
             wait_time    = self.wait_time_spin.value()
             use_gaussian = self.gaussian_checkbox.isChecked()
+            avg_every    = self.avg_every_spin.value() if self.avg_every_checkbox.isChecked() else 1
 
-            self.log_status(f"▶ Live: chunk={chunk_size}, wait={wait_time}s")
-            self.viewer_backend.start_live_monitoring(chunk_size, wait_time, use_gaussian_filter=use_gaussian)
+            self.log_status(f"▶ Live: chunk={chunk_size}, wait={wait_time}s, avg={avg_every}")
+            self.viewer_backend.start_live_monitoring(
+                chunk_size, wait_time, use_gaussian_filter=use_gaussian, avg_every=avg_every
+            )
 
             self._populate_channel_dropdown()
             self.viewer_backend.updater.data_ready.connect(self.on_data_ready)
@@ -798,9 +871,95 @@ class ThorlabsGUI(QMainWindow):
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Failed to start:\n{e}")
 
+    def _start_disk_stream(self):
+        """Open a finished acquisition in disk-stream (lazy) mode."""
+        try:
+            # Reset any existing backend
+            if self.viewer_backend is not None:
+                self.stop_monitoring()
+                if hasattr(self.viewer_backend, 'close'):
+                    self.viewer_backend.close()
+                self.viewer_backend = None
+                self.napari_shapes_layer = None
+                self.napari_labels_layer = None
+
+            avg_every = self.avg_every_spin.value() if self.avg_every_checkbox.isChecked() else 1
+            self.log_status(f"Initializing disk-stream backend (avg_every={avg_every})…")
+            self.disk_viewer = DiskStreamedViewer(
+                self.current_folder, viewer=self.napari_viewer, avg_every=avg_every
+            )
+            # Store as viewer_backend for compatibility with shared methods
+            self.viewer_backend = self.disk_viewer
+
+            # Add dask arrays as Napari layers
+            self.disk_viewer.add_to_viewer()
+
+            self._populate_channel_dropdown()
+            self.connect_to_napari_shapes()
+
+            # Wire ROI updater signals
+            self.disk_viewer.roi_updater.progress.connect(self._on_disk_roi_progress)
+            self.disk_viewer.roi_updater.finished.connect(self._on_disk_roi_finished)
+            self.disk_viewer.roi_updater.cancelled.connect(self._on_disk_roi_cancelled)
+
+            # UI state
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.restart_button.setEnabled(False)
+            self.progress_bar.setVisible(False)
+            n = self.disk_viewer.nFrames
+            self.progress_label.setText(f"💾 {n} frames (disk-streamed)")
+            self._set_mode_controls_enabled(True)
+
+            # Disable auto-ROI (too slow for disk-stream mode)
+            self._pre_disk_auto_roi = self.auto_roi_checkbox.isChecked()
+            self.auto_roi_checkbox.setChecked(False)
+            self.auto_roi_checkbox.setEnabled(False)
+
+            self.log_status(f"✅ Opened {n} frames in disk-stream mode — "
+                            "scroll to browse, press 'Update ROIs' to compute traces")
+
+        except Exception as e:
+            self.log_status(f"❌ Error: {e}")
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed to open:\n{e}")
+
+    def _on_disk_roi_progress(self, current, total):
+        """Update progress bar during disk-stream ROI computation."""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.progress_label.setText(f"Computing ROIs… {current}/{total}")
+
+    def _on_disk_roi_finished(self, roi_data):
+        """Handle completed disk-stream ROI computation."""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText(f"💾 {self.disk_viewer.nFrames} frames (disk-streamed)")
+        self.force_roi_button.setEnabled(True)
+        self.roi_data = roi_data
+        self.last_roi_frame_index = self.disk_viewer.nFrames
+        self._replot_roi_data()
+        self.log_status(f"✅ ROI traces computed ({len(roi_data)} ROIs)")
+
+    def _on_disk_roi_cancelled(self):
+        """Handle cancelled disk-stream ROI computation."""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText(f"💾 {self.disk_viewer.nFrames} frames (disk-streamed)")
+        self.force_roi_button.setEnabled(True)
+        self.log_status("⚠️  ROI computation cancelled")
+
     def _start_offline(self):
         """Load a finished acquisition — all frames at once, no live-edge waiting."""
         try:
+            # Reset if wrong backend type
+            if self.viewer_backend is not None and not isinstance(self.viewer_backend, ThorlabsLiveViewerSimple):
+                self.stop_monitoring()
+                if hasattr(self.viewer_backend, 'close'):
+                    self.viewer_backend.close()
+                self.viewer_backend = None
+                self.napari_shapes_layer = None
+                self.napari_labels_layer = None
+
             if self.viewer_backend is None:
                 self.log_status("Initializing backend…")
                 self.viewer_backend = ThorlabsLiveViewerSimple(
@@ -809,14 +968,20 @@ class ThorlabsGUI(QMainWindow):
 
             chunk_size   = self.chunk_size_spin.value()
             use_gaussian = self.gaussian_checkbox.isChecked()
+            avg_every    = self.avg_every_spin.value() if self.avg_every_checkbox.isChecked() else 1
 
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
             self.restart_button.setEnabled(False)
             self.progress_bar.setVisible(True)
-            self.progress_bar.setMaximum(self.viewer_backend.nFrames)
+            if avg_every > 1:
+                expected_frames = self.viewer_backend.nFrames // avg_every
+                self.progress_bar.setMaximum(expected_frames)
+                self.log_status(f"📂 Loading {self.viewer_backend.nFrames} frames (averaging to ~{expected_frames} frames)...")
+            else:
+                self.progress_bar.setMaximum(self.viewer_backend.nFrames)
+                self.log_status(f"📂 Loading all {self.viewer_backend.nFrames} frames…")
             self.progress_label.setText("Loading…")
-            self.log_status(f"📂 Loading all {self.viewer_backend.nFrames} frames…")
             self._set_mode_controls_enabled(False)
 
             self._populate_channel_dropdown()
@@ -835,6 +1000,7 @@ class ThorlabsGUI(QMainWindow):
                 chunk_size=chunk_size,
                 use_gaussian_filter=use_gaussian,
                 progress_callback=_progress,
+                avg_every=avg_every,
             )
 
             def _check_done():
@@ -876,6 +1042,13 @@ class ThorlabsGUI(QMainWindow):
             self.progress_bar.setVisible(False)
             self.progress_label.setText("Stopped")
             self._set_mode_controls_enabled(True)
+
+            # Restore auto-ROI checkbox if it was disabled by disk-stream mode
+            if hasattr(self, '_pre_disk_auto_roi'):
+                self.auto_roi_checkbox.setEnabled(True)
+                self.auto_roi_checkbox.setChecked(self._pre_disk_auto_roi)
+                del self._pre_disk_auto_roi
+
             self.log_status("Stopped")
     
     def restart_monitoring(self):
@@ -888,8 +1061,9 @@ class ThorlabsGUI(QMainWindow):
             chunk_size = self.chunk_size_spin.value()
             wait_time = self.wait_time_spin.value()
             use_gaussian = self.gaussian_checkbox.isChecked()
+            avg_every = self.avg_every_spin.value() if self.avg_every_checkbox.isChecked() else 1
             
-            self.viewer_backend.restart_monitoring(chunk_size, wait_time, use_gaussian_filter=use_gaussian)
+            self.viewer_backend.restart_monitoring(chunk_size, wait_time, use_gaussian_filter=use_gaussian, avg_every=avg_every)
             self.connect_to_napari_shapes()
             self.log_status("Restarted")
     
@@ -1104,7 +1278,17 @@ class ThorlabsGUI(QMainWindow):
 
     def force_roi_update(self):
         """Force a full ROI recalculation from all currently loaded frames."""
-        if not self.viewer_backend or not hasattr(self.viewer_backend, 'arrays'):
+        if not self.viewer_backend:
+            self.log_status("⚠️  No data loaded yet")
+            return
+
+        # --- Disk-stream mode: async ROI computation ---
+        if isinstance(self.viewer_backend, DiskStreamedViewer):
+            self._force_disk_roi_update()
+            return
+
+        # --- RAM-based modes ---
+        if not hasattr(self.viewer_backend, 'arrays'):
             self.log_status("⚠️  No data loaded yet")
             return
         selected_ch = self.roi_channel_combo.currentText()
@@ -1117,14 +1301,104 @@ class ThorlabsGUI(QMainWindow):
         self.update_roi_plot(self.viewer_backend.arrays[selected_ch])
         self.log_status("🔄 ROI plot updated")
 
+    def _force_disk_roi_update(self):
+        """Compute ROI traces from disk in background thread."""
+        dv = self.disk_viewer
+        selected_ch = self.roi_channel_combo.currentText()
+        ch_idx = self.viewer_backend.channel_names.index(selected_ch)
+
+        # Refresh layer references
+        self.connect_to_napari_shapes()
+        use_labels = self.napari_labels_layer is not None
+        use_shapes = (not use_labels) and (self.napari_shapes_layer is not None)
+
+        if not use_labels and not use_shapes:
+            self.log_status("⚠️  No ROIs defined")
+            return
+
+        H, W = dv.height, dv.width
+        masks = []
+        roi_names = []
+
+        if use_labels:
+            labels_data = self.napari_labels_layer.data
+            if labels_data.ndim > 2:
+                labels_data = labels_data[0]
+            for lv in np.unique(labels_data):
+                if lv == 0:
+                    continue
+                masks.append(labels_data == lv)
+                roi_names.append(f"Label_{lv}")
+        else:
+            from skimage.draw import polygon
+            for i, shape in enumerate(self.napari_shapes_layer.data):
+                if len(shape) >= 3:
+                    r, c = polygon(shape[:, 0], shape[:, 1], (H, W))
+                    if len(r) > 0:
+                        mask = np.zeros((H, W), dtype=bool)
+                        mask[r, c] = True
+                        masks.append(mask)
+                        roi_names.append(f"ROI_{i}")
+
+        if not masks:
+            self.log_status("⚠️  No valid ROIs found")
+            return
+
+        # Assign colours for new ROI names
+        for name in roi_names:
+            if name not in self.roi_color_map:
+                color = self.roi_colors[self.color_index % len(self.roi_colors)]
+                self.roi_color_map[name] = color
+                self.color_index += 1
+
+        self.force_roi_button.setEnabled(False)
+        self.roi_data = {}
+        self.log_status(f"🔄 Computing ROI traces from disk ({len(masks)} ROIs, {dv.nFrames} frames)…")
+        dv.compute_roi_traces_async(ch_idx, masks, roi_names)
+
     def average_last_n_frames(self):
         """Average the last N frames from the livestream and display in Napari"""
-        if not self.viewer_backend or not hasattr(self.viewer_backend, 'arrays'):
+        if not self.viewer_backend:
             self.log_status("⚠️  No data loaded yet")
             return
         
         n = self.avg_n_frames_spin.value()
-        
+        _ch_colormaps = {'Ch1': 'green', 'Ch2': 'red'}
+
+        # --- Disk-stream mode: read frames from disk ---
+        if isinstance(self.viewer_backend, DiskStreamedViewer):
+            dv = self.disk_viewer
+            total = dv.nFrames
+            n_actual = min(n, total)
+            start = total - n_actual
+
+            for ch_idx, ch_name in enumerate(dv.channel_names):
+                frames = dv.read_frames_range(start, total, ch_idx)
+                avg_frame = np.mean(frames, axis=0)
+
+                layer_name = f"Average (last N) - {ch_name}"
+                existing = None
+                for layer in self.napari_viewer.layers:
+                    if layer.name == layer_name:
+                        existing = layer
+                        break
+                cmap = _ch_colormaps.get(ch_name, 'gray')
+                if existing is not None:
+                    existing.data = avg_frame
+                else:
+                    self.napari_viewer.add_image(
+                        avg_frame, name=layer_name,
+                        colormap=cmap, blending='additive'
+                    )
+
+            self.log_status(f"📸 Averaged last {n_actual} frames (of {total} total, from disk)")
+            return
+
+        # --- RAM-based modes ---
+        if not hasattr(self.viewer_backend, 'arrays'):
+            self.log_status("⚠️  No data loaded yet")
+            return
+
         for ch_name, data in self.viewer_backend.arrays.items():
             if data.size == 0:
                 continue
@@ -1133,7 +1407,6 @@ class ThorlabsGUI(QMainWindow):
             
             avg_frame = np.mean(data[-n_actual:], axis=0)
             
-            # Add or update the averaged layer in Napari
             layer_name = f"Average (last N) - {ch_name}"
             existing = None
             for layer in self.napari_viewer.layers:
@@ -1141,7 +1414,6 @@ class ThorlabsGUI(QMainWindow):
                     existing = layer
                     break
             
-            _ch_colormaps = {'Ch1': 'green', 'Ch2': 'red'}
             cmap = _ch_colormaps.get(ch_name, 'gray')
             if existing is not None:
                 existing.data = avg_frame
@@ -1166,23 +1438,37 @@ class ThorlabsGUI(QMainWindow):
             self.log_status("❌ cellpose is not installed (pip install cellpose)")
             return
 
-        if not self.viewer_backend or not hasattr(self.viewer_backend, 'arrays'):
+        if not self.viewer_backend:
             self.log_status("⚠️  No data loaded yet")
             return
 
         selected_ch = self.roi_channel_combo.currentText()
-        if selected_ch not in self.viewer_backend.arrays:
-            self.log_status(f"⚠️  Channel '{selected_ch}' not available")
-            return
 
-        data = self.viewer_backend.arrays[selected_ch]
-        if data.size == 0:
-            self.log_status("⚠️  No frames in selected channel")
-            return
-
-        # Build input image: average of the last 100 frames
-        n_avg = min(100, data.shape[0])
-        img = np.mean(data[-n_avg:], axis=0).astype(np.float32)
+        # --- Disk-stream mode: read frames from disk ---
+        if isinstance(self.viewer_backend, DiskStreamedViewer):
+            dv = self.disk_viewer
+            ch_idx = dv.channel_names.index(selected_ch)
+            total = dv.nFrames
+            if total == 0:
+                self.log_status("⚠️  No frames in selected channel")
+                return
+            n_avg = min(100, total)
+            frames = dv.read_frames_range(total - n_avg, total, ch_idx)
+            img = np.mean(frames, axis=0).astype(np.float32)
+        else:
+            # --- RAM-based modes ---
+            if not hasattr(self.viewer_backend, 'arrays'):
+                self.log_status("⚠️  No data loaded yet")
+                return
+            if selected_ch not in self.viewer_backend.arrays:
+                self.log_status(f"⚠️  Channel '{selected_ch}' not available")
+                return
+            data = self.viewer_backend.arrays[selected_ch]
+            if data.size == 0:
+                self.log_status("⚠️  No frames in selected channel")
+                return
+            n_avg = min(100, data.shape[0])
+            img = np.mean(data[-n_avg:], axis=0).astype(np.float32)
 
         diameter = float(self.cellpose_diameter_spin.value())
         flow_threshold = float(self.cellpose_prob_spin.value())
