@@ -20,6 +20,9 @@ This application allows users to view live updates of `Image_001_001.raw` files 
 
 ### 1. Setup Environment
 
+**For users without Python experience:** Please read the [Installation Guide](INSTALLATION_GUIDE.md) for simple, 1-click installation instructions.
+
+**For developers:**
 It is recommended to use a virtual environment:
 
 ```bash
