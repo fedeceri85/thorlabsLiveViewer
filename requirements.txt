@@ -14,5 +14,5 @@ PyQt5  # or PySide2, napari usually pulls one, but being explicit helps
 # cupy-cuda12x
 # pyclesperanto-prototype
 
-# Optional - uncomment for auto-segmentation features
-# cellpose
+# Optional 
+cellpose

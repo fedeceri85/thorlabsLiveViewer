@@ -3,6 +3,9 @@
 Welcome! You do not need to know any programming to install and use the **Thorlabs Live Viewer**. Just follow these simple steps depending on your computer.
 
 ---
+## Optional: Add GPU Acceleration & AI Features
+If you have a powerful NVIDIA graphics card, you can enable hardware acceleration to speed up image smoothing (Gaussian filters) and AI-based automatic segmentation (Cellpose). See below for instructions
+
 
 ## 🟦 Windows Users
 
@@ -12,6 +15,7 @@ If you don't already have Python installed, you need to download it:
 2. Click the yellow **Download Python** button.
 3. Open the downloaded installer file.
 4. **⚠️ CRITICAL STEP:** At the bottom of the installation window, check the box that says **"Add python.exe to PATH"** before you click Install Now.
+
 
 ### Step 2: Install the App
 1. Download this software folder to your computer and unzip it.
@@ -34,10 +38,11 @@ If you don't already have Python installed:
 ### Step 2: Install the App
 1. Download this software folder to your Mac and unzip it.
 2. Open the folder, right-click (or Control-click) on **`setup_mac.command`**, and select **Open**. (If your Mac shows a warning about it being from an unidentified developer, click "Open" anyway).
-3. A terminal window will open and download the necessary files. Wait until it says "SETUP COMPLETE!".
+3. If this does not work, right click on the program folder in Finder and select Services/New Terminal at Folder. In the terminal, type **`xattr -d com.apple.quarantine setup_mac.command`** and **`./setup_mac.command`**. 
+4. A terminal window will open and download the necessary files. Wait until it says "SETUP COMPLETE!".
 
 ### Step 3: Run the App
-- Whenever you want to use the software, simply **double-click `start_mac.command`**.
+- Whenever you want to use the software, simply **double-click `start_mac.command`** or run the software from terminal (see point 3. above) **`./start_mac.command`**.
 
 ---
 
@@ -50,8 +55,6 @@ If you don't already have Python installed:
 
 ## ⚡ Advanced: Optional GPU Acceleration & AI Features
 
-If you have a powerful NVIDIA graphics card, you can enable hardware acceleration to speed up image smoothing (Gaussian filters) and enable AI-based automatic segmentation (Cellpose).
-
 ### How to Enable:
 1. **Install NVIDIA CUDA Toolkit (Windows/Linux only)**
    - Download the **CUDA Toolkit 12.x** from the [NVIDIA Website](https://developer.nvidia.com/cuda-downloads).
@@ -59,8 +62,8 @@ If you have a powerful NVIDIA graphics card, you can enable hardware acceleratio
 
 2. **Enable the Requirements**
    - Open the `requirements.txt` file in this folder using any text editor (like Notepad).
-   - Find the lines that say `# cupy-cuda12x` and `# cellpose` at the bottom.
-   - Delete the `#` and the space at the start of those lines so they just say `cupy-cuda12x` and `cellpose`.
+   - Find the lines that say `# cupy-cuda12x` at the bottom.
+   - Delete the `#` and the space at the start of those lines so they just say `cupy-cuda12x`.
    - Save the file.
 
 3. **Re-run the Setup Script**

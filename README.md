@@ -12,9 +12,7 @@ This application allows users to view live updates of `Image_001_001.raw` files 
 - 📂 **Experiment Management**: Browse root folders and select active experiments from a dynamic dropdown.
 - 🚀 **Real-time Monitoring**: Background threading for live data updates with Gaussian smoothing (GPU support via `cupy` if available).
 - 📊 **ROI Monitoring**: Draw shapes in Napari to plot mean intensity values in real-time.
-- ⚙️ **Parameter Control**: Adjust chunk size and wait times on the fly.
-- �️ **Thread Safety**: Robust Qt-based implementation compatible with Linux and macOS.
-- 🎬 **Test Data Generation**: Includes a simulator for testing without a physical microscope.
+
 
 ## Quick Start
 
