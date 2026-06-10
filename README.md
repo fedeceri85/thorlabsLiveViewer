@@ -87,6 +87,10 @@ The application expects folders to contain:
 - Dependencies: `numpy`, `napari`, `qtpy`, `pyqtgraph`, `scikit-image`, `scipy`.
 - Optional: `cupy` or `pyclesperanto_prototype` for GPU acceleration.
 
+## License
+
+This project is released under the MIT License. See the `LICENSE` file for details.
+
 ## Author
 
 Federico Ceriani  
